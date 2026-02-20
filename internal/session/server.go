@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,7 +20,8 @@ import (
 )
 
 type Config struct {
-	ListenAddr      string
+	ListenQUIC      string
+	ListenTCP       string
 	TLSConfig       *tls.Config
 	IdleTimeout     time.Duration
 	DialTimeout     time.Duration
@@ -38,13 +40,20 @@ type Server struct {
 	metrics  *metrics.Metrics
 	logger   *zap.Logger
 
-	listener *quic.Listener
+	quicListener *quic.Listener
+	tcpListener  net.Listener
 
 	store *store.SessionStore
 
 	mu       sync.RWMutex
-	sessions map[uint64]*Session
+	sessions map[uint64]managedSession
 	nextID   atomic.Uint64
+}
+
+type managedSession interface {
+	ID() uint64
+	ClientID() string
+	Close(reason string)
 }
 
 func NewServer(cfg Config, verifier *auth.Verifier, lim *limits.Manager, m *metrics.Metrics, logger *zap.Logger) *Server {
@@ -56,7 +65,7 @@ func NewServer(cfg Config, verifier *auth.Verifier, lim *limits.Manager, m *metr
 		metrics:  m,
 		logger:   logger,
 		store:    store.NewSessionStore(wheel),
-		sessions: make(map[uint64]*Session),
+		sessions: make(map[uint64]managedSession),
 	}
 }
 
@@ -64,7 +73,45 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.cfg.TLSConfig == nil {
 		return errors.New("session server requires TLS config")
 	}
+	if s.cfg.ListenQUIC == "" && s.cfg.ListenTCP == "" {
+		return errors.New("session server requires at least one of listen_quic or listen_tcp")
+	}
 
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	started := 0
+	errCh := make(chan error, 2)
+
+	if s.cfg.ListenQUIC != "" {
+		started++
+		go func() {
+			errCh <- s.serveQUIC(runCtx)
+		}()
+	}
+	if s.cfg.ListenTCP != "" {
+		started++
+		go func() {
+			errCh <- s.serveTCP(runCtx)
+		}()
+	}
+
+	for remaining := started; remaining > 0; {
+		select {
+		case <-runCtx.Done():
+			return nil
+		case err := <-errCh:
+			remaining--
+			if err != nil {
+				cancel()
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Server) serveQUIC(ctx context.Context) error {
 	keepAlive := s.cfg.KeepAlive
 	if keepAlive == 0 {
 		keepAlive = 12 * time.Second
@@ -76,13 +123,13 @@ func (s *Server) Start(ctx context.Context) error {
 		KeepAlivePeriod: keepAlive,
 	}
 
-	ln, err := quic.ListenAddr(s.cfg.ListenAddr, s.cfg.TLSConfig, quicCfg)
+	ln, err := quic.ListenAddr(s.cfg.ListenQUIC, s.cfg.TLSConfig, quicCfg)
 	if err != nil {
-		return fmt.Errorf("listen quic %s: %w", s.cfg.ListenAddr, err)
+		return fmt.Errorf("listen quic %s: %w", s.cfg.ListenQUIC, err)
 	}
-	s.listener = ln
+	s.quicListener = ln
 
-	s.logger.Info("session lane listening", zap.String("addr", s.cfg.ListenAddr))
+	s.logger.Info("session QUIC lane listening", zap.String("addr", s.cfg.ListenQUIC))
 
 	go func() {
 		<-ctx.Done()
@@ -118,14 +165,65 @@ func (s *Server) handleConn(conn *quic.Conn) {
 	}
 }
 
-func (s *Server) registerSession(sess *Session) {
+func (s *Server) serveTCP(ctx context.Context) error {
+	ln, err := tls.Listen("tcp", s.cfg.ListenTCP, s.cfg.TLSConfig)
+	if err != nil {
+		return fmt.Errorf("listen tcp %s: %w", s.cfg.ListenTCP, err)
+	}
+	s.tcpListener = ln
+	s.logger.Info("session TCP lane listening", zap.String("addr", s.cfg.ListenTCP))
+
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				s.logger.Warn("accept TCP conn temporary error", zap.Error(err))
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			s.logger.Warn("accept TCP conn failed", zap.Error(err))
+			continue
+		}
+
+		go s.handleTCPConn(conn)
+	}
+}
+
+func (s *Server) handleTCPConn(conn net.Conn) {
+	sessionID := s.nextID.Add(1)
+	sessLogger := s.logger.With(
+		zap.Uint64("session_id", sessionID),
+		zap.String("remote_addr", conn.RemoteAddr().String()),
+		zap.String("transport", "tcp"),
+	)
+
+	sess := newTCPSession(sessionID, conn, s, sessLogger)
+	if err := sess.Run(); err != nil {
+		sessLogger.Warn("tcp session finished with error", zap.Error(err))
+	} else {
+		sessLogger.Info("tcp session finished")
+	}
+}
+
+func (s *Server) registerSession(sess managedSession) {
 	s.mu.Lock()
-	s.sessions[sess.id] = sess
+	s.sessions[sess.ID()] = sess
 	s.mu.Unlock()
 
 	s.store.Add(&store.SessionState{
-		SessionID:  sess.id,
-		ClientID:   sess.clientID,
+		SessionID:  sess.ID(),
+		ClientID:   sess.ClientID(),
 		CreatedAt:  time.Now(),
 		LastActive: time.Now(),
 	}, s.cfg.IdleTimeout, func() {
@@ -157,12 +255,15 @@ func (s *Server) unregisterSession(sessionID uint64) {
 }
 
 func (s *Server) Shutdown() {
-	if s.listener != nil {
-		_ = s.listener.Close()
+	if s.quicListener != nil {
+		_ = s.quicListener.Close()
+	}
+	if s.tcpListener != nil {
+		_ = s.tcpListener.Close()
 	}
 
 	s.mu.RLock()
-	snapshot := make([]*Session, 0, len(s.sessions))
+	snapshot := make([]managedSession, 0, len(s.sessions))
 	for _, sess := range s.sessions {
 		snapshot = append(snapshot, sess)
 	}

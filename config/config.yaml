@@ -1,5 +1,6 @@
 listen_http: ":8080"
 listen_quic: ":443"
+listen_tcp: ":443"
 allow_insecure_http: true
 protocol_id: "vlf-runtime/0.1"
 log_level: "info"

@@ -12,6 +12,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"vlf-runtime/internal/auth"
 )
 
 type openReq struct {
@@ -61,14 +63,14 @@ func bodyHashHex(body []byte) string {
 }
 
 // sig = hex(HMAC_SHA256(secret, `method|path|ts|nonce|body_hash`))
-func makeSig(secret, method, path string, tsMs int64, nonce string, body []byte) string {
+func makeSig(secret []byte, method, path string, tsMs int64, nonce string, body []byte) string {
 	payload := fmt.Sprintf("%s|%s|%d|%s|%s", method, path, tsMs, nonce, bodyHashHex(body))
-	m := hmac.New(sha256.New, []byte(secret))
+	m := hmac.New(sha256.New, secret)
 	m.Write([]byte(payload))
 	return hex.EncodeToString(m.Sum(nil))
 }
 
-func addAuthHeaders(req *http.Request, clientID, secret string, body []byte) {
+func addAuthHeaders(req *http.Request, clientID string, secret []byte, body []byte) {
 	tsMs := time.Now().UnixMilli()
 	nonce := fmt.Sprintf("%d-%d", tsMs, time.Now().UnixNano())
 
@@ -88,7 +90,11 @@ func main() {
 	dialPort := mustAtoi(env("RELAY_DIAL_PORT", "9000"), 9000)
 
 	clientID := envAny([]string{"VLF_CLIENT", "VLF_CLIENT_ID"}, "smoke-client")
-	secret := env("VLF_SECRET", "smoke-secret")
+	secretRaw := env("VLF_SECRET", "smoke-secret")
+	secret, err := auth.ParseSecretString(secretRaw)
+	if err != nil {
+		fail("invalid VLF_SECRET format: %v", err)
+	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
 

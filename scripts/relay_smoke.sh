@@ -7,6 +7,7 @@ RELAY_BASE="${RELAY_BASE:-http://gateway:8080}"
 RELAY_DIAL_HOST="${RELAY_DIAL_HOST:-tcp-echo}"
 RELAY_DIAL_PORT="${RELAY_DIAL_PORT:-9000}"
 VLF_CLIENT="${VLF_CLIENT:-${VLF_CLIENT_ID:-smoke-client}}"
+VLF_CLIENT_ID="${VLF_CLIENT_ID:-$VLF_CLIENT}"
 VLF_SECRET="${VLF_SECRET:-smoke-secret}"
 
 if [[ -z "$NET" ]]; then
@@ -19,6 +20,7 @@ docker run --rm --network "$NET" \
   -e RELAY_DIAL_HOST \
   -e RELAY_DIAL_PORT \
   -e VLF_CLIENT \
+  -e VLF_CLIENT_ID \
   -e VLF_SECRET \
   -v "$ROOT":/src -w /src golang:1.24-alpine sh -c '
   apk add --no-cache git ca-certificates &&

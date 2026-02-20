@@ -63,6 +63,7 @@ type AuthConfig struct {
 type Config struct {
 	ListenHTTP        string            `yaml:"listen_http"`
 	ListenQUIC        string            `yaml:"listen_quic"`
+	ListenTCP         string            `yaml:"listen_tcp"`
 	AllowInsecureHTTP bool              `yaml:"allow_insecure_http"`
 	ProtocolID        string            `yaml:"protocol_id"`
 	LogLevel          string            `yaml:"log_level"`
@@ -78,6 +79,7 @@ func Default() *Config {
 	return &Config{
 		ListenHTTP:        ":8080",
 		ListenQUIC:        ":443",
+		ListenTCP:         ":443",
 		AllowInsecureHTTP: true,
 		ProtocolID:        "vlf-runtime/0.1",
 		LogLevel:          "info",
@@ -138,6 +140,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ListenQUIC == "" {
 		c.ListenQUIC = def.ListenQUIC
+	}
+	if c.ListenTCP == "" {
+		c.ListenTCP = def.ListenTCP
 	}
 	if c.ProtocolID == "" {
 		c.ProtocolID = def.ProtocolID

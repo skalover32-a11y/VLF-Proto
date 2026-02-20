@@ -1,3 +1,6 @@
 /certs/
 /bin/
+/out/
+/scripts/out/
+*.exe
 *.log

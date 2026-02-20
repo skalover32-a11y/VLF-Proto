@@ -60,6 +60,14 @@ type Session struct {
 	udpFlows map[uint64]*udpFlow
 }
 
+func (s *Session) ID() uint64 {
+	return s.id
+}
+
+func (s *Session) ClientID() string {
+	return s.clientID
+}
+
 func newSession(id uint64, conn *quic.Conn, server *Server, logger *zap.Logger) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Session{

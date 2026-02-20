@@ -79,7 +79,7 @@ func (v *Verifier) VerifyHTTP(r *http.Request, body []byte) (string, error) {
 
 	bodyHash := HashBody(body)
 	material := fmt.Sprintf("%s|%s|%d|%s|%s", strings.ToUpper(r.Method), r.URL.Path, tsMS, nonce, bodyHash)
-	expected := computeHMAC([]byte(secret), []byte(material))
+	expected := computeHMAC(secret, []byte(material))
 
 	providedSig, err := hex.DecodeString(sigHex)
 	if err != nil {
@@ -114,7 +114,7 @@ func (v *Verifier) SignSession(clientID string, tsMS uint64, nonce []byte, caps 
 	if err != nil {
 		return nil, err
 	}
-	return computeHMAC([]byte(secret), SessionAuthMaterial(clientID, tsMS, nonce, caps)), nil
+	return computeHMAC(secret, SessionAuthMaterial(clientID, tsMS, nonce, caps)), nil
 }
 
 func (v *Verifier) VerifySession(clientID string, tsMS uint64, nonce, sig []byte, caps uint64) error {
@@ -140,7 +140,7 @@ func (v *Verifier) VerifySession(clientID string, tsMS uint64, nonce, sig []byte
 		return err
 	}
 
-	expected := computeHMAC([]byte(secret), SessionAuthMaterial(clientID, tsMS, nonce, caps))
+	expected := computeHMAC(secret, SessionAuthMaterial(clientID, tsMS, nonce, caps))
 	if !hmac.Equal(expected, sig) {
 		v.markAuthFail(clientID)
 		return ErrBadSignature

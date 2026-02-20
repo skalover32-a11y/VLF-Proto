@@ -60,7 +60,10 @@ func main() {
 	m := metrics.New()
 	defer m.Close()
 
-	secretProvider := auth.NewStaticSecretProvider(cfg.ClientSecrets)
+	secretProvider, err := auth.NewStaticSecretProvider(cfg.ClientSecrets)
+	if err != nil {
+		logger.Fatal("invalid client secret format", zap.Error(err))
+	}
 	replayCache := auth.NewReplayCache(cfg.Auth.ReplayTTL.Duration)
 	verifier := auth.NewVerifier(secretProvider, replayCache, cfg.Auth.ClockSkew.Duration, auth.VerifyHooks{
 		OnAuthFail: func(_ string) {
@@ -89,7 +92,8 @@ func main() {
 	relayServer := relay.NewServer(relayManager, verifier, m, logger.With(zap.String("component", "relay_http")))
 
 	sessionServer := session.NewServer(session.Config{
-		ListenAddr:      cfg.ListenQUIC,
+		ListenQUIC:      cfg.ListenQUIC,
+		ListenTCP:       cfg.ListenTCP,
 		TLSConfig:       tlsConf,
 		IdleTimeout:     cfg.Timeouts.SessionIdle.Duration,
 		DialTimeout:     cfg.Timeouts.DialTimeout.Duration,

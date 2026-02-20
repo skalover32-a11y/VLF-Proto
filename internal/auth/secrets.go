@@ -2,34 +2,41 @@ package auth
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 )
 
 var ErrUnknownClient = errors.New("unknown client")
 
 type SecretProvider interface {
-	SecretFor(clientID string) (string, error)
+	SecretFor(clientID string) ([]byte, error)
 }
 
 type StaticSecretProvider struct {
 	mu      sync.RWMutex
-	secrets map[string]string
+	secrets map[string][]byte
 }
 
-func NewStaticSecretProvider(secrets map[string]string) *StaticSecretProvider {
-	cp := make(map[string]string, len(secrets))
+func NewStaticSecretProvider(secrets map[string]string) (*StaticSecretProvider, error) {
+	cp := make(map[string][]byte, len(secrets))
 	for k, v := range secrets {
-		cp[k] = v
+		parsed, err := ParseSecretString(v)
+		if err != nil {
+			return nil, fmt.Errorf("parse secret for client %q: %w", k, err)
+		}
+		cp[k] = parsed
 	}
-	return &StaticSecretProvider{secrets: cp}
+	return &StaticSecretProvider{secrets: cp}, nil
 }
 
-func (p *StaticSecretProvider) SecretFor(clientID string) (string, error) {
+func (p *StaticSecretProvider) SecretFor(clientID string) ([]byte, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	secret, ok := p.secrets[clientID]
 	if !ok {
-		return "", ErrUnknownClient
+		return nil, ErrUnknownClient
 	}
-	return secret, nil
+	out := make([]byte, len(secret))
+	copy(out, secret)
+	return out, nil
 }

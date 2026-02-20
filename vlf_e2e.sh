@@ -92,7 +92,11 @@ log "Run SESSION (QUIC) smoke test"
 # Prefer script if present, else go run.
 if [[ -f "./scripts/session_smoke.sh" ]]; then
   chmod +x ./scripts/session_smoke.sh || true
+  GATEWAY_HOST="${GATEWAY_HOST:-gateway}" \
+  GATEWAY_PORT_UDP="${GATEWAY_PORT_UDP:-443}" \
+  GATEWAY_PORT_TCP="${GATEWAY_PORT_TCP:-443}" \
   SESSION_ADDR="${SESSION_ADDR:-gateway:443}" \
+  RELAY_BASE="${RELAY_BASE:-http://gateway:8080}" \
   VLF_CLIENT_ID="${VLF_CLIENT_ID:-${VLF_CLIENT:-smoke-client}}" \
   VLF_SECRET="${VLF_SECRET:-smoke-secret}" \
   VLF_PROTO_ID="${VLF_PROTO_ID:-vlf-runtime/0.1}" \
