@@ -188,8 +188,12 @@ func (s *Session) controlLoop() {
 	for {
 		frame, err := ReadFrame(s.controlR)
 		if err != nil {
-			if !errors.Is(err, io.EOF) && s.ctx.Err() == nil {
-				s.logger.Warn("control stream read failed", zap.Error(err))
+			if s.ctx.Err() == nil {
+				if isExpectedSessionCloseErr(err) {
+					s.logger.Debug("control stream closed", zap.Error(err))
+				} else {
+					s.logger.Warn("control stream read failed", zap.Error(err))
+				}
 			}
 			s.Close("control_read_end")
 			return
@@ -235,8 +239,13 @@ func (s *Session) acceptFlowStreams() {
 		stream, err := s.conn.AcceptStream(s.ctx)
 		if err != nil {
 			if s.ctx.Err() == nil {
-				s.logger.Warn("accept flow stream failed", zap.Error(err))
-				s.Close("accept_flow_stream_error")
+				if isExpectedSessionCloseErr(err) {
+					s.logger.Debug("accept flow stream closed", zap.Error(err))
+					s.Close("accept_flow_stream_end")
+				} else {
+					s.logger.Warn("accept flow stream failed", zap.Error(err))
+					s.Close("accept_flow_stream_error")
+				}
 			}
 			return
 		}
@@ -337,7 +346,13 @@ func (s *Session) pumpTCPFlow(flow *tcpFlow) {
 	}()
 
 	if err := <-errCh; err != nil {
-		s.logger.Warn("tcp flow pump ended with error", zap.Uint64("flow_id", flow.id), zap.Error(err))
+		if s.ctx.Err() == nil {
+			if isExpectedSessionCloseErr(err) {
+				s.logger.Debug("tcp flow pump ended", zap.Uint64("flow_id", flow.id), zap.Error(err))
+			} else {
+				s.logger.Warn("tcp flow pump ended with error", zap.Uint64("flow_id", flow.id), zap.Error(err))
+			}
+		}
 		if errors.Is(err, limits.ErrMaxBytesPerMinuteSess) {
 			s.Close("session_bytes_limit")
 			return
@@ -354,7 +369,11 @@ func (s *Session) datagramLoop() {
 		raw, err := s.conn.ReceiveDatagram(s.ctx)
 		if err != nil {
 			if s.ctx.Err() == nil {
-				s.logger.Warn("receive datagram failed", zap.Error(err))
+				if isExpectedSessionCloseErr(err) {
+					s.logger.Debug("receive datagram loop closed", zap.Error(err))
+				} else {
+					s.logger.Warn("receive datagram failed", zap.Error(err))
+				}
 			}
 			return
 		}
@@ -644,4 +663,25 @@ func resolveTargetAddress(p OpenPayload) (string, error) {
 	}
 
 	return net.JoinHostPort(host, fmt.Sprintf("%d", p.DstPort)), nil
+}
+
+func isExpectedSessionCloseErr(err error) bool {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+
+	var appErr *quic.ApplicationError
+	if errors.As(err, &appErr) && appErr.ErrorCode == 0 {
+		return true
+	}
+
+	var streamErr *quic.StreamError
+	if errors.As(err, &streamErr) && streamErr.ErrorCode == 0 {
+		return true
+	}
+
+	return false
 }
