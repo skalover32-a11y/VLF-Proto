@@ -46,12 +46,37 @@ Relay:
 ./scripts/relay_smoke.sh
 ```
 
+Relay smoke directly from docker network (no host Go toolchain required):
+
+```bash
+NET=$(docker network ls --format '{{.Name}}' | grep -E 'vlf-proto|vlf' | head -n1)
+docker run --rm --network "$NET" -v "$PWD":/src -w /src golang:1.24-alpine sh -lc \
+  'apk add --no-cache git ca-certificates && \
+   RELAY_BASE=http://gateway:8080 RELAY_DIAL_HOST=tcp-echo RELAY_DIAL_PORT=9000 \
+   VLF_CLIENT=smoke-client VLF_SECRET=smoke-secret \
+   go run ./scripts/relay_smoke.go'
+```
+
+`relay_smoke.go` accepts `VLF_CLIENT` or `VLF_CLIENT_ID`, and `VLF_SECRET`.
+
 Session (QUIC TCP+UDP):
 
 ```bash
-go run ./scripts/session_smoke.go
-# or
 ./scripts/session_smoke.sh
+# or
+go run ./scripts/session_smoke.go
+```
+
+Windows (PowerShell, no local Go required):
+
+```powershell
+.\scripts\test-vlf.ps1
+```
+
+Optional binary build step (for running smoke clients without local Go toolchain):
+
+```powershell
+.\scripts\test-vlf.ps1 -BuildBinaries
 ```
 
 Expected output:
@@ -241,9 +266,48 @@ Key fields:
 - `timeouts.relay_idle`, `timeouts.session_idle`, `timeouts.dial_timeout`
 - `max_dgram_payload`
 
+Gateway docker setup mounts `./certs` to `/app/certs` and uses:
+
+- `tls.cert_path: /app/certs/gateway.crt`
+- `tls.key_path: /app/certs/gateway.key`
+
 For development certs:
 
 - when `tls.auto_generate: true`, gateway auto-generates self-signed cert if missing.
+
+Generate your own self-signed cert (recommended for reproducible pinning):
+
+```bash
+mkdir -p certs
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout certs/gateway.key \
+  -out certs/gateway.crt \
+  -days 365 \
+  -subj "/CN=gateway" \
+  -addext "subjectAltName=DNS:gateway,DNS:localhost,IP:127.0.0.1"
+```
+
+Compute SPKI pin (`sha256(SPKI DER)` in base64):
+
+```bash
+PIN=$(openssl x509 -in certs/gateway.crt -pubkey -noout \
+  | openssl pkey -pubin -outform DER \
+  | openssl dgst -sha256 -binary \
+  | openssl base64 -A)
+echo "$PIN"
+```
+
+Run session smoke in pin mode:
+
+```bash
+VLF_PIN_SPKI="$PIN" ./scripts/session_smoke.sh
+```
+
+Run session smoke in insecure mode (default):
+
+```bash
+./scripts/session_smoke.sh
+```
 
 ## HTTPS for Relay
 
