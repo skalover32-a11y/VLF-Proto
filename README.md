@@ -30,7 +30,7 @@ docker compose up -d
 
 Services:
 
-- `gateway` (HTTP relay on `:8080`, session on `:443/tcp` + `:443/udp`, optional extra `:8443/udp` mapping to session UDP)
+- `gateway` (HTTP relay on `:8080`, session on `443:443` TCP + `443:443/udp`, optional extra `8443:443/udp` mapping to session UDP)
 - `tcp-echo` (internal `:9000`)
 - `udp-echo` (internal `:9001`)
 - optional `prometheus` profile (`:9090`)
@@ -40,6 +40,12 @@ Gateway config in container: `config/config.yaml`.
 ## Smoke tests
 
 Run after `docker compose up -d`.
+
+`./vlf_e2e.sh` now asserts host TCP `:443` is exposed/listening using:
+
+```bash
+ss -ltnp | grep ':443'
+```
 
 Relay:
 

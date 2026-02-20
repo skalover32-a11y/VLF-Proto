@@ -5,9 +5,10 @@ PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
 GATEWAY_SERVICE="${GATEWAY_SERVICE:-gateway}"
 HTTP_PORT="${HTTP_PORT:-8080}"
 QUIC_PORT="${QUIC_PORT:-443}"
+TCP_PORT="${TCP_PORT:-443}"
 
 # If your compose has different service names, set env:
-# GATEWAY_SERVICE=gateway HTTP_PORT=8080 QUIC_PORT=443 ./vlf_e2e.sh
+# GATEWAY_SERVICE=gateway HTTP_PORT=8080 QUIC_PORT=443 TCP_PORT=443 ./vlf_e2e.sh
 
 log() { echo -e "\n==> $*\n"; }
 die() { echo -e "\n[FAIL] $*\n"; exit 1; }
@@ -25,6 +26,7 @@ need_cmd awk
 need_cmd sed
 need_cmd grep
 need_cmd head
+need_cmd ss
 
 # Docker compose v2 plugin is expected: `docker compose`
 if ! docker compose version >/dev/null 2>&1; then
@@ -62,6 +64,10 @@ log "Check /metrics contains expected lines (basic sanity)"
 METRICS="$(curl -fsS "http://127.0.0.1:${HTTP_PORT}/metrics" | head -n 200)"
 echo "$METRICS" | grep -E "active_(sessions|relay_conns)|bytes_(in|out)|auth_(failures|replay)|udp_pps" >/dev/null 2>&1 \
   || die "Metrics sanity check failed: expected basic metric names not found. Check /metrics output."
+
+log "Assert host TCP :${TCP_PORT} is listening"
+ss -ltnp | grep ":${TCP_PORT}" >/dev/null 2>&1 \
+  || die "Expected host TCP :${TCP_PORT} listener, but none found (ss -ltnp | grep ':${TCP_PORT}')"
 
 log "Check that UDP ${QUIC_PORT} is listening inside container (best-effort)"
 # This is best-effort; container images may not include ss/netstat.
