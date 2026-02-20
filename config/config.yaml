@@ -6,8 +6,8 @@ log_level: "info"
 max_dgram_payload: 1200
 
 tls:
-  cert_path: "/app/certs/dev.crt"
-  key_path: "/app/certs/dev.key"
+  cert_path: "/app/certs/gateway.crt"
+  key_path: "/app/certs/gateway.key"
   auto_generate: true
 
 client_secrets:
