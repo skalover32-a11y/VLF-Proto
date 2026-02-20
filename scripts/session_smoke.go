@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -16,6 +19,7 @@ import (
 	"log"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -26,9 +30,10 @@ import (
 
 func main() {
 	addr := envOr("SESSION_ADDR", "localhost:443")
-	clientID := envOr("VLF_CLIENT_ID", "smoke-client")
+	clientID := envAny([]string{"VLF_CLIENT_ID", "VLF_CLIENT"}, "smoke-client")
 	secret := envOr("VLF_SECRET", "smoke-secret")
 	protoID := envOr("VLF_PROTO_ID", "vlf-runtime/0.1")
+	pinSPKI := envOr("VLF_PIN_SPKI", "")
 	dstTCPHost := envOr("DST_TCP_HOST", "tcp-echo")
 	dstTCPPort := envOrInt("DST_TCP_PORT", 9000)
 	dstUDPHost := envOr("DST_UDP_HOST", "udp-echo")
@@ -41,6 +46,31 @@ func main() {
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{protoID},
+	}
+	if strings.TrimSpace(pinSPKI) != "" {
+		expectedPin, err := decodeSPKIPin(pinSPKI)
+		if err != nil {
+			log.Fatalf("invalid VLF_PIN_SPKI: %v", err)
+		}
+		log.Printf("TLS pinning enabled (SPKI sha256)")
+		tlsConf.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return errors.New("tls pinning failed: no server certificate")
+			}
+			cert, err := x509.ParseCertificate(rawCerts[0])
+			if err != nil {
+				return fmt.Errorf("tls pinning parse cert: %w", err)
+			}
+			hash := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+			if !hmac.Equal(hash[:], expectedPin) {
+				return fmt.Errorf(
+					"tls pin mismatch: got=%s want=%s",
+					base64.StdEncoding.EncodeToString(hash[:]),
+					base64.StdEncoding.EncodeToString(expectedPin),
+				)
+			}
+			return nil
+		}
 	}
 
 	conn, err := quic.DialAddr(ctx, addr, tlsConf, &quic.Config{
@@ -303,6 +333,15 @@ func envOr(name, fallback string) string {
 	return fallback
 }
 
+func envAny(names []string, fallback string) string {
+	for _, name := range names {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
+	}
+	return fallback
+}
+
 func envOrInt(name string, fallback int) int {
 	if v := os.Getenv(name); v != "" {
 		var parsed int
@@ -311,4 +350,24 @@ func envOrInt(name string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func decodeSPKIPin(raw string) ([]byte, error) {
+	pin := strings.TrimSpace(raw)
+	pin = strings.TrimPrefix(pin, "sha256/")
+	if pin == "" {
+		return nil, errors.New("empty pin")
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(pin)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(pin)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("base64 decode: %w", err)
+	}
+	if len(decoded) != crypto.SHA256.Size() {
+		return nil, fmt.Errorf("pin length must be %d bytes, got %d", crypto.SHA256.Size(), len(decoded))
+	}
+	return decoded, nil
 }

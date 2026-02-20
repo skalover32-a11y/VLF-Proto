@@ -33,6 +33,15 @@ func env(k, def string) string {
 	return def
 }
 
+func envAny(keys []string, def string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return def
+}
+
 func mustAtoi(s string, def int) int {
 	n, err := strconv.Atoi(s)
 	if err != nil {
@@ -78,7 +87,7 @@ func main() {
 	dialHost := env("RELAY_DIAL_HOST", "tcp-echo")
 	dialPort := mustAtoi(env("RELAY_DIAL_PORT", "9000"), 9000)
 
-	clientID := env("VLF_CLIENT", "smoke-client")
+	clientID := envAny([]string{"VLF_CLIENT", "VLF_CLIENT_ID"}, "smoke-client")
 	secret := env("VLF_SECRET", "smoke-secret")
 
 	client := &http.Client{Timeout: 10 * time.Second}

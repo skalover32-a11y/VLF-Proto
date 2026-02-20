@@ -13,7 +13,7 @@ services:
       - "443:443/udp"
     volumes:
       - ./config/config.yaml:/app/config/config.yaml:ro
-      - ./certs:/app/certs
+      - ./certs:/app/certs:rw
     restart: unless-stopped
 
   tcp-echo:

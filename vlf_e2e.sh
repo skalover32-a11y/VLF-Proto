@@ -23,6 +23,8 @@ need_cmd docker
 need_cmd curl
 need_cmd awk
 need_cmd sed
+need_cmd grep
+need_cmd head
 
 # Docker compose v2 plugin is expected: `docker compose`
 if ! docker compose version >/dev/null 2>&1; then
@@ -34,6 +36,14 @@ docker compose up -d --build
 
 log "Services status"
 docker compose ps
+
+log "Detect compose network (gateway container)"
+GW_CID="$(docker compose ps -q "$GATEWAY_SERVICE" | head -n1 || true)"
+[[ -n "${GW_CID:-}" ]] || die "Could not find gateway container id for service '$GATEWAY_SERVICE'"
+COMPOSE_NET="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{println $k}}{{end}}' "$GW_CID" | head -n1 | tr -d '\r' || true)"
+[[ -n "${COMPOSE_NET:-}" ]] || die "Could not detect compose network for gateway container"
+export NET="$COMPOSE_NET"
+echo "Using docker network: $NET"
 
 log "Wait for gateway HTTP to be ready on :${HTTP_PORT}"
 for i in {1..40}; do
@@ -64,6 +74,11 @@ fi
 log "Run RELAY smoke test"
 if [[ -f "./scripts/relay_smoke.sh" ]]; then
   chmod +x ./scripts/relay_smoke.sh || true
+  RELAY_BASE="${RELAY_BASE:-http://gateway:8080}" \
+  RELAY_DIAL_HOST="${RELAY_DIAL_HOST:-tcp-echo}" \
+  RELAY_DIAL_PORT="${RELAY_DIAL_PORT:-9000}" \
+  VLF_CLIENT="${VLF_CLIENT:-smoke-client}" \
+  VLF_SECRET="${VLF_SECRET:-smoke-secret}" \
   ./scripts/relay_smoke.sh || {
     log "Relay smoke failed. Dump logs:"
     docker compose logs -n 250 "$GATEWAY_SERVICE" || true
@@ -77,6 +92,15 @@ log "Run SESSION (QUIC) smoke test"
 # Prefer script if present, else go run.
 if [[ -f "./scripts/session_smoke.sh" ]]; then
   chmod +x ./scripts/session_smoke.sh || true
+  SESSION_ADDR="${SESSION_ADDR:-gateway:443}" \
+  VLF_CLIENT_ID="${VLF_CLIENT_ID:-${VLF_CLIENT:-smoke-client}}" \
+  VLF_SECRET="${VLF_SECRET:-smoke-secret}" \
+  VLF_PROTO_ID="${VLF_PROTO_ID:-vlf-runtime/0.1}" \
+  DST_TCP_HOST="${DST_TCP_HOST:-tcp-echo}" \
+  DST_TCP_PORT="${DST_TCP_PORT:-9000}" \
+  DST_UDP_HOST="${DST_UDP_HOST:-udp-echo}" \
+  DST_UDP_PORT="${DST_UDP_PORT:-9001}" \
+  MAX_DGRAM_PAYLOAD="${MAX_DGRAM_PAYLOAD:-1200}" \
   ./scripts/session_smoke.sh || {
     log "Session smoke failed. Dump logs:"
     docker compose logs -n 250 "$GATEWAY_SERVICE" || true
