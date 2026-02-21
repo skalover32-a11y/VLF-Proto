@@ -27,26 +27,29 @@ import (
 )
 
 type benchOptions struct {
-	Clients       int
-	Duration      time.Duration
-	TCPFlows      int
-	TCPTotalMB    int
-	TCPChunkBytes int
-	UDPPPS        int
-	UDPPayload    int
-	TargetTCPHost string
-	TargetTCPPort int
-	TargetUDPHost string
-	TargetUDPPort int
-	PreferQUIC    bool
-	DisableQUIC   bool
-	DisableTCP    bool
-	DisableRelay  bool
-	ForceUDPBlock bool
-	Soak          time.Duration
-	ReportJSON    string
-	ReportMD      string
-	MetricsListen string
+	Clients        int
+	Duration       time.Duration
+	TCPFlows       int
+	TCPTotalMB     int
+	TCPChunkBytes  int
+	TCPMinMbps     float64
+	UDPPPS         int
+	UDPPayload     int
+	UDPMaxLoss     float64
+	UDPMaxJitterMS float64
+	TargetTCPHost  string
+	TargetTCPPort  int
+	TargetUDPHost  string
+	TargetUDPPort  int
+	PreferQUIC     bool
+	DisableQUIC    bool
+	DisableTCP     bool
+	DisableRelay   bool
+	ForceUDPBlock  bool
+	Soak           time.Duration
+	ReportJSON     string
+	ReportMD       string
+	MetricsListen  string
 }
 
 type benchReport struct {
@@ -65,28 +68,36 @@ type benchReport struct {
 }
 
 type tcpThroughputResult struct {
-	Transport    string  `json:"transport"`
-	Flows        int     `json:"flows"`
-	BytesTotal   int64   `json:"bytes_total"`
-	ElapsedSec   float64 `json:"elapsed_sec"`
-	Mbps         float64 `json:"mbps"`
-	LatencyP95MS float64 `json:"latency_p95_ms"`
-	LatencyP99MS float64 `json:"latency_p99_ms"`
-	Samples      int     `json:"samples"`
-	Error        string  `json:"error,omitempty"`
+	Transport     string  `json:"transport"`
+	Flows         int     `json:"flows"`
+	BytesTotal    int64   `json:"bytes_total"`
+	ElapsedSec    float64 `json:"elapsed_sec"`
+	Mbps          float64 `json:"mbps"`
+	LatencyP95MS  float64 `json:"latency_p95_ms"`
+	LatencyP99MS  float64 `json:"latency_p99_ms"`
+	Samples       int     `json:"samples"`
+	MinMbps       float64 `json:"min_mbps"`
+	PassByQuality bool    `json:"pass_by_quality"`
+	QualityReason string  `json:"quality_reason,omitempty"`
+	Error         string  `json:"error,omitempty"`
 }
 
 type udpPPSResult struct {
-	Transport    string  `json:"transport"`
-	Sent         int64   `json:"sent"`
-	Received     int64   `json:"received"`
-	LossPercent  float64 `json:"loss_percent"`
-	JitterMS     float64 `json:"jitter_ms"`
-	RTTP95MS     float64 `json:"rtt_p95_ms"`
-	RTTP99MS     float64 `json:"rtt_p99_ms"`
-	ElapsedSec   float64 `json:"elapsed_sec"`
-	EffectivePPS float64 `json:"effective_pps"`
-	Error        string  `json:"error,omitempty"`
+	Transport     string  `json:"transport"`
+	Sent          int64   `json:"sent"`
+	Received      int64   `json:"received"`
+	LossRatio     float64 `json:"loss_ratio"`
+	LossPercent   float64 `json:"loss_percent"`
+	JitterMS      float64 `json:"jitter_ms"`
+	RTTP95MS      float64 `json:"rtt_p95_ms"`
+	RTTP99MS      float64 `json:"rtt_p99_ms"`
+	ElapsedSec    float64 `json:"elapsed_sec"`
+	EffectivePPS  float64 `json:"effective_pps"`
+	MaxLossRatio  float64 `json:"max_loss_ratio"`
+	MaxJitterMS   float64 `json:"max_jitter_ms"`
+	PassByQuality bool    `json:"pass_by_quality"`
+	QualityReason string  `json:"quality_reason,omitempty"`
+	Error         string  `json:"error,omitempty"`
 }
 
 type concurrencyResult struct {
@@ -146,9 +157,12 @@ func main() {
 	flag.IntVar(&opts.TCPTotalMB, "tcp-total-mb", 64, "total payload size for TCP throughput test in MB")
 	flag.IntVar(&opts.TCPTotalMB, "tcp-mb", 64, "alias for --tcp-total-mb")
 	flag.IntVar(&opts.TCPChunkBytes, "tcp-chunk-bytes", 32*1024, "per write chunk size for TCP throughput")
+	flag.Float64Var(&opts.TCPMinMbps, "tcp-min-mbps", 1.0, "minimum TCP throughput in Mbps required to pass quality criteria")
 	flag.IntVar(&opts.UDPPPS, "udp-pps", 2000, "target packets per second for UDP PPS test")
 	flag.IntVar(&opts.UDPPPS, "udp-ps", 2000, "alias for --udp-pps")
 	flag.IntVar(&opts.UDPPayload, "udp-payload-bytes", 256, "UDP payload size in bytes")
+	flag.Float64Var(&opts.UDPMaxLoss, "udp-max-loss", 0.05, "maximum allowed UDP loss ratio (0.05 = 5%)")
+	flag.Float64Var(&opts.UDPMaxJitterMS, "udp-max-jitter-ms", 50.0, "maximum allowed UDP jitter in milliseconds")
 	flag.StringVar(&opts.TargetTCPHost, "target-tcp-host", envOr("BENCH_TARGET_TCP_HOST", "tcp-echo"), "TCP benchmark target host")
 	flag.IntVar(&opts.TargetTCPPort, "target-tcp-port", envOrInt("BENCH_TARGET_TCP_PORT", 9000), "TCP benchmark target port")
 	flag.StringVar(&opts.TargetUDPHost, "target-udp-host", envOr("BENCH_TARGET_UDP_HOST", "udp-echo"), "UDP benchmark target host")
@@ -181,17 +195,20 @@ func main() {
 		HostArch:  runtime.GOARCH,
 		Options:   opts,
 		Config: map[string]any{
-			"gateway_host":     baseCfg.GatewayHost,
-			"gateway_port_udp": baseCfg.GatewayUDP,
-			"gateway_port_tcp": baseCfg.GatewayTCP,
-			"relay_base":       baseCfg.RelayBase,
-			"proto_id":         baseCfg.ProtoID,
-			"prefer_quic":      baseCfg.PreferQUIC,
-			"disable_quic":     baseCfg.DisableQUIC,
-			"disable_tcp":      baseCfg.DisableTCPSession,
-			"allow_relay":      baseCfg.AllowRelay,
-			"force_udp_block":  opts.ForceUDPBlock,
-			"metrics_listen":   opts.MetricsListen,
+			"gateway_host":      baseCfg.GatewayHost,
+			"gateway_port_udp":  baseCfg.GatewayUDP,
+			"gateway_port_tcp":  baseCfg.GatewayTCP,
+			"relay_base":        baseCfg.RelayBase,
+			"proto_id":          baseCfg.ProtoID,
+			"prefer_quic":       baseCfg.PreferQUIC,
+			"disable_quic":      baseCfg.DisableQUIC,
+			"disable_tcp":       baseCfg.DisableTCPSession,
+			"allow_relay":       baseCfg.AllowRelay,
+			"force_udp_block":   opts.ForceUDPBlock,
+			"tcp_min_mbps":      opts.TCPMinMbps,
+			"udp_max_loss":      opts.UDPMaxLoss,
+			"udp_max_jitter_ms": opts.UDPMaxJitterMS,
+			"metrics_listen":    opts.MetricsListen,
 		},
 	}
 
@@ -211,6 +228,8 @@ func main() {
 	}
 	if tcpRes.Error != "" {
 		report.Errors = append(report.Errors, "tcp_throughput: "+tcpRes.Error)
+	} else if !tcpRes.PassByQuality {
+		report.Errors = append(report.Errors, "tcp_throughput_quality: "+tcpRes.QualityReason)
 	}
 
 	udpRes := runUDPPPS(baseCfg, opts)
@@ -222,6 +241,8 @@ func main() {
 	}
 	if udpRes.Error != "" {
 		report.Errors = append(report.Errors, "udp_pps: "+udpRes.Error)
+	} else if !udpRes.PassByQuality {
+		report.Errors = append(report.Errors, "udp_pps_quality: "+udpRes.QualityReason)
 	}
 
 	concRes := runConcurrency(baseCfg, opts)
@@ -273,7 +294,9 @@ func main() {
 
 func runTCPThroughput(cfg sessionclient.Config, opts benchOptions) tcpThroughputResult {
 	res := tcpThroughputResult{
-		Flows: opts.TCPFlows,
+		Flows:         opts.TCPFlows,
+		MinMbps:       opts.TCPMinMbps,
+		PassByQuality: false,
 	}
 	if opts.TCPFlows <= 0 {
 		res.Error = "tcp-flows must be > 0"
@@ -393,11 +416,24 @@ func runTCPThroughput(cfg sessionclient.Config, opts benchOptions) tcpThroughput
 		res.LatencyP95MS = percentile(latencies, 95)
 		res.LatencyP99MS = percentile(latencies, 99)
 	}
+	if res.Error != "" {
+		res.QualityReason = "runtime error"
+		return res
+	}
+	if res.Mbps < opts.TCPMinMbps {
+		res.QualityReason = fmt.Sprintf("mbps %.2f is below minimum %.2f", res.Mbps, opts.TCPMinMbps)
+		return res
+	}
+	res.PassByQuality = true
 	return res
 }
 
 func runUDPPPS(cfg sessionclient.Config, opts benchOptions) udpPPSResult {
-	res := udpPPSResult{}
+	res := udpPPSResult{
+		MaxLossRatio:  opts.UDPMaxLoss,
+		MaxJitterMS:   opts.UDPMaxJitterMS,
+		PassByQuality: false,
+	}
 	if opts.UDPPPS <= 0 {
 		res.Error = "udp-pps must be > 0"
 		return res
@@ -504,7 +540,8 @@ done:
 	res.Received = received
 	res.ElapsedSec = time.Since(start).Seconds()
 	if sent > 0 {
-		res.LossPercent = float64(sent-received) * 100.0 / float64(sent)
+		res.LossRatio = float64(sent-received) / float64(sent)
+		res.LossPercent = res.LossRatio * 100.0
 	}
 	if res.ElapsedSec > 0 {
 		res.EffectivePPS = float64(received) / res.ElapsedSec
@@ -514,6 +551,24 @@ done:
 		res.RTTP99MS = percentile(rtts, 99)
 		res.JitterMS = jitterFromRTT(rtts)
 	}
+	if res.Error != "" {
+		res.QualityReason = "runtime error"
+		return res
+	}
+
+	qualityIssues := make([]string, 0, 2)
+	if res.LossRatio > opts.UDPMaxLoss {
+		qualityIssues = append(qualityIssues, fmt.Sprintf("loss ratio %.4f exceeds max %.4f", res.LossRatio, opts.UDPMaxLoss))
+	}
+	if res.JitterMS > opts.UDPMaxJitterMS {
+		qualityIssues = append(qualityIssues, fmt.Sprintf("jitter %.2fms exceeds max %.2fms", res.JitterMS, opts.UDPMaxJitterMS))
+	}
+	if len(qualityIssues) > 0 {
+		res.QualityReason = strings.Join(qualityIssues, "; ")
+		return res
+	}
+
+	res.PassByQuality = true
 	return res
 }
 
@@ -825,14 +880,16 @@ func printSummary(report benchReport) {
 	fmt.Println("---------------------------------------------------------------")
 	fmt.Printf("%-20s %-12s %-12s %-12s\n", "Test", "Transport", "Main", "Status")
 	fmt.Println("---------------------------------------------------------------")
-	fmt.Printf("%-20s %-12s %-12.2f %-12s\n", "TCP throughput", report.TCP.Transport, report.TCP.Mbps, statusOf(report.TCP.Error))
-	fmt.Printf("%-20s %-12s %-12.2f %-12s\n", "UDP PPS", report.UDP.Transport, report.UDP.EffectivePPS, statusOf(report.UDP.Error))
+	fmt.Printf("%-20s %-12s %-12.2f %-12s\n", "TCP throughput", report.TCP.Transport, report.TCP.Mbps, statusLane(report.TCP.Error, report.TCP.PassByQuality))
+	fmt.Printf("%-20s %-12s %-12.2f %-12s\n", "UDP PPS", report.UDP.Transport, report.UDP.EffectivePPS, statusLane(report.UDP.Error, report.UDP.PassByQuality))
 	fmt.Printf("%-20s %-12s %-12d %-12s\n", "Concurrency", "-", report.Concurrent.Success, statusFromCounts(report.Concurrent.Fail))
 	fmt.Printf("%-20s %-12s %-12d %-12s\n", "Fallback", "-", report.Fallback.Success, statusFromCounts(report.Fallback.Fail))
 	if report.Soak != nil {
 		fmt.Printf("%-20s %-12s %-12d %-12s\n", "Soak", "-", report.Soak.Success, statusFromCounts(report.Soak.Fail))
 	}
 	fmt.Println("---------------------------------------------------------------")
+	fmt.Printf("TCP threshold: min %.2f Mbps, pass_by_quality=%t\n", report.TCP.MinMbps, report.TCP.PassByQuality)
+	fmt.Printf("UDP thresholds: max loss %.2f%%, max jitter %.2f ms, pass_by_quality=%t\n", report.UDP.MaxLossRatio*100.0, report.UDP.MaxJitterMS, report.UDP.PassByQuality)
 	fmt.Printf("TCP p95/p99: %.2f / %.2f ms\n", report.TCP.LatencyP95MS, report.TCP.LatencyP99MS)
 	fmt.Printf("UDP loss/jitter: %.2f%% / %.2f ms\n", report.UDP.LossPercent, report.UDP.JitterMS)
 	fmt.Printf("Handshake p95/p99: %.2f / %.2f ms\n", report.Concurrent.HandshakeP95MS, report.Concurrent.HandshakeP99MS)
@@ -861,14 +918,22 @@ func writeMarkdown(path string, report benchReport) error {
 	b.WriteString("\n## Summary\n\n")
 	b.WriteString("| Test | Transport | Main | Status |\n")
 	b.WriteString("|---|---|---:|---|\n")
-	b.WriteString(fmt.Sprintf("| TCP throughput | %s | %.2f Mbps | %s |\n", report.TCP.Transport, report.TCP.Mbps, statusOf(report.TCP.Error)))
-	b.WriteString(fmt.Sprintf("| UDP PPS | %s | %.2f pps | %s |\n", report.UDP.Transport, report.UDP.EffectivePPS, statusOf(report.UDP.Error)))
+	b.WriteString(fmt.Sprintf("| TCP throughput | %s | %.2f Mbps | %s |\n", report.TCP.Transport, report.TCP.Mbps, statusLane(report.TCP.Error, report.TCP.PassByQuality)))
+	b.WriteString(fmt.Sprintf("| UDP PPS | %s | %.2f pps | %s |\n", report.UDP.Transport, report.UDP.EffectivePPS, statusLane(report.UDP.Error, report.UDP.PassByQuality)))
 	b.WriteString(fmt.Sprintf("| Concurrency | - | %d/%d success | %s |\n", report.Concurrent.Success, report.Concurrent.Clients, statusFromCounts(report.Concurrent.Fail)))
 	b.WriteString(fmt.Sprintf("| Fallback | - | %d/%d success | %s |\n", report.Fallback.Success, report.Fallback.Attempts, statusFromCounts(report.Fallback.Fail)))
 	if report.Soak != nil {
 		b.WriteString(fmt.Sprintf("| Soak | - | %d/%d success | %s |\n", report.Soak.Success, report.Soak.Iterations, statusFromCounts(report.Soak.Fail)))
 	}
 	b.WriteString("\n## Details\n\n")
+	b.WriteString(fmt.Sprintf("- TCP threshold: min `%.2f Mbps`, pass_by_quality=`%t`\n", report.TCP.MinMbps, report.TCP.PassByQuality))
+	if report.TCP.QualityReason != "" {
+		b.WriteString(fmt.Sprintf("- TCP quality reason: `%s`\n", report.TCP.QualityReason))
+	}
+	b.WriteString(fmt.Sprintf("- UDP thresholds: max_loss=`%.4f` (%.2f%%), max_jitter_ms=`%.2f`, pass_by_quality=`%t`\n", report.UDP.MaxLossRatio, report.UDP.MaxLossRatio*100.0, report.UDP.MaxJitterMS, report.UDP.PassByQuality))
+	if report.UDP.QualityReason != "" {
+		b.WriteString(fmt.Sprintf("- UDP quality reason: `%s`\n", report.UDP.QualityReason))
+	}
 	b.WriteString(fmt.Sprintf("- TCP p95/p99 latency: `%.2f / %.2f ms`\n", report.TCP.LatencyP95MS, report.TCP.LatencyP99MS))
 	b.WriteString(fmt.Sprintf("- UDP loss/jitter: `%.2f%% / %.2f ms`\n", report.UDP.LossPercent, report.UDP.JitterMS))
 	b.WriteString(fmt.Sprintf("- Handshake p95/p99: `%.2f / %.2f ms`\n", report.Concurrent.HandshakeP95MS, report.Concurrent.HandshakeP99MS))
@@ -885,9 +950,12 @@ func writeMarkdown(path string, report benchReport) error {
 	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
-func statusOf(errText string) string {
+func statusLane(errText string, passByQuality bool) string {
 	if strings.TrimSpace(errText) == "" {
-		return "PASS"
+		if passByQuality {
+			return "PASS"
+		}
+		return "FAIL"
 	}
 	return "FAIL"
 }

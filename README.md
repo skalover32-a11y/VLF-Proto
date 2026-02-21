@@ -99,7 +99,8 @@ Implemented benchmark groups:
 Run (Linux/macOS):
 
 ```bash
-./scripts/run-bench.sh --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000
+./scripts/run-bench.sh --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000 \
+  --tcp-min-mbps 1.0 --udp-max-loss 0.05 --udp-max-jitter-ms 50
 ```
 
 `run-bench.sh` reads `scripts/.env` when present.
@@ -107,7 +108,8 @@ Run (Linux/macOS):
 Run (Windows PowerShell):
 
 ```powershell
-.\scripts\run-bench.ps1 -- --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000
+.\scripts\run-bench.ps1 -- --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000 `
+  --tcp-min-mbps 1.0 --udp-max-loss 0.05 --udp-max-jitter-ms 50
 ```
 
 `run-bench.ps1` also imports `scripts/.env` by default.
@@ -131,6 +133,9 @@ Important flags:
 - `--target-udp-host`, `--target-udp-port` (defaults `udp-echo:9001`)
 - `--tcp-total-mb` (alias: `--tcp-mb`)
 - `--udp-pps` (alias: `--udp-ps`)
+- `--tcp-min-mbps` (default `1.0`, below threshold => TCP benchmark FAIL by quality)
+- `--udp-max-loss` (default `0.05` = 5%, above threshold => UDP benchmark FAIL by quality)
+- `--udp-max-jitter-ms` (default `50`, above threshold => UDP benchmark FAIL by quality)
 - `--prefer-quic`, `--disable-quic`, `--disable-tcp-session`, `--disable-relay-fallback`
 - `--force-udp-block` (client-side QUIC disable mode to emulate blocked UDP path)
 - `--soak`
