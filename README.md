@@ -99,7 +99,7 @@ Implemented benchmark groups:
 Run (Linux/macOS):
 
 ```bash
-./scripts/run-bench.sh --clients 50 --duration 60s
+./scripts/run-bench.sh --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000
 ```
 
 `run-bench.sh` reads `scripts/.env` when present.
@@ -107,7 +107,7 @@ Run (Linux/macOS):
 Run (Windows PowerShell):
 
 ```powershell
-.\scripts\run-bench.ps1 -- --clients 50 --duration 60s
+.\scripts\run-bench.ps1 -- --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000
 ```
 
 `run-bench.ps1` also imports `scripts/.env` by default.
@@ -129,6 +129,8 @@ Important flags:
 
 - `--target-tcp-host`, `--target-tcp-port` (defaults `tcp-echo:9000`)
 - `--target-udp-host`, `--target-udp-port` (defaults `udp-echo:9001`)
+- `--tcp-total-mb` (alias: `--tcp-mb`)
+- `--udp-pps` (alias: `--udp-ps`)
 - `--prefer-quic`, `--disable-quic`, `--disable-tcp-session`, `--disable-relay-fallback`
 - `--force-udp-block` (client-side QUIC disable mode to emulate blocked UDP path)
 - `--soak`

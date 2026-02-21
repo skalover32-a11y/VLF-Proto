@@ -1,5 +1,9 @@
 <#
 Run proto_bench from Windows with native Go or Dockerized Go fallback.
+
+Examples:
+  .\scripts\run-bench.ps1 -- --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000
+  .\scripts\run-bench.ps1 -- --clients 20 --duration 30s --tcp-total-mb 256 --udp-pps 2000 --metrics-listen :2112
 #>
 
 [CmdletBinding()]
