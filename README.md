@@ -11,6 +11,7 @@ Production-grade MVP gateway in Go with two traffic lanes:
 - `cmd/gateway` - main gateway binary
 - `cmd/tcp-echo` - TCP echo service for smoke tests
 - `cmd/udp-echo` - UDP echo service for smoke tests
+- `cmd/proto_bench` - pre-alpha protocol benchmark tool
 - `internal/relay` - Relay HTTP API v0.1
 - `internal/session` - Session QUIC protocol v0.1
 - `internal/auth` - HMAC auth + replay protection
@@ -82,6 +83,55 @@ Common session smoke env vars:
 - `RELAY_BASE` (default `http://<GATEWAY_HOST>:8080`)
 - `VLF_DEBUG=1` enables detailed transport diagnostics (DNS, UDP probe, dial errors).
 - `VLF_DISABLE_RELAY_FALLBACK=1` forces failure if QUIC/TCP session transports fail (useful for negative pin/auth tests).
+
+## Protocol Bench (pre-alpha)
+
+`cmd/proto_bench` runs real protocol traffic benchmarks through the VLF session client stack.
+
+Implemented benchmark groups:
+
+1. TCP throughput: opens `N` parallel TCP flows through session protocol and measures Mbps + p95/p99 RTT per chunk.
+2. UDP PPS: opens UDP flow, sends at target PPS for `--duration`, reports loss/jitter (seq-based).
+3. Concurrency: runs `--clients` parallel sessions with TCP+UDP checks and handshake latency stats.
+4. Fallback share: measures QUIC/TCP/relay distribution under current transport flags.
+5. Soak: long-running repeated probes with `--soak=30m` / `2h`.
+
+Run (Linux/macOS):
+
+```bash
+./scripts/run-bench.sh --clients 50 --duration 60s
+```
+
+`run-bench.sh` reads `scripts/.env` when present.
+
+Run (Windows PowerShell):
+
+```powershell
+.\scripts\run-bench.ps1 -- --clients 50 --duration 60s
+```
+
+`run-bench.ps1` also imports `scripts/.env` by default.
+
+Direct Go run:
+
+```bash
+go run ./cmd/proto_bench --clients 50 --duration 60s
+```
+
+Output:
+
+- stdout summary table (transport + throughput/latency/loss)
+- `report.json` (default `proto_bench_report.json`)
+- `report.md` (default `proto_bench_report.md`)
+- optional metrics endpoint via `--metrics-listen :2112` (`/metrics`)
+
+Important flags:
+
+- `--target-tcp-host`, `--target-tcp-port` (defaults `tcp-echo:9000`)
+- `--target-udp-host`, `--target-udp-port` (defaults `udp-echo:9001`)
+- `--prefer-quic`, `--disable-quic`, `--disable-tcp-session`, `--disable-relay-fallback`
+- `--force-udp-block` (client-side QUIC disable mode to emulate blocked UDP path)
+- `--soak`
 
 Windows full test runner (dotenv + report generation):
 
