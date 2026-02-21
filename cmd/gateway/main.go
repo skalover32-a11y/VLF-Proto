@@ -103,6 +103,8 @@ func main() {
 		DownKbps:        cfg.Limits.SessionDownKbps,
 		MaxUDPPPS:       cfg.Limits.MaxUDPPPS,
 		KeepAlive:       12 * time.Second,
+		DatagramWorkers: cfg.Limits.SessionDatagramWorkers,
+		DatagramQueue:   cfg.Limits.SessionDatagramQueue,
 	}, verifier, limiter, m, logger.With(zap.String("component", "session_quic")))
 
 	httpSrv := &http.Server{

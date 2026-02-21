@@ -91,7 +91,7 @@ Common session smoke env vars:
 Implemented benchmark groups:
 
 1. TCP throughput: opens `N` parallel TCP flows through session protocol and measures Mbps + p95/p99 RTT per chunk.
-2. UDP PPS: opens UDP flow, sends at target PPS for `--duration`, reports loss/jitter (seq-based).
+2. UDP PPS: opens UDP flow, sends at target PPS for `--duration` with burst pacing (`--udp-burst`), reports loss/jitter (seq-based).
 3. Concurrency: runs `--clients` parallel sessions with TCP+UDP checks and handshake latency stats.
 4. Fallback share: measures QUIC/TCP/relay distribution under current transport flags.
 5. Soak: long-running repeated probes with `--soak=30m` / `2h`.
@@ -99,7 +99,7 @@ Implemented benchmark groups:
 Run (Linux/macOS):
 
 ```bash
-./scripts/run-bench.sh --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000 \
+./scripts/run-bench.sh --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000 --udp-burst 10 \
   --tcp-min-mbps 1.0 --udp-max-loss 0.05 --udp-max-jitter-ms 50
 ```
 
@@ -108,7 +108,7 @@ Run (Linux/macOS):
 Run (Windows PowerShell):
 
 ```powershell
-.\scripts\run-bench.ps1 -- --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000 `
+.\scripts\run-bench.ps1 -- --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000 --udp-burst 10 `
   --tcp-min-mbps 1.0 --udp-max-loss 0.05 --udp-max-jitter-ms 50
 ```
 
@@ -126,6 +126,7 @@ Output:
 - `report.json` (default `proto_bench_report.json`)
 - `report.md` (default `proto_bench_report.md`)
 - optional metrics endpoint via `--metrics-listen :2112` (`/metrics`)
+- if gateway metrics are reachable via `RELAY_BASE`, report also includes `server_udp_drop_reasons`
 
 Important flags:
 
@@ -133,6 +134,7 @@ Important flags:
 - `--target-udp-host`, `--target-udp-port` (defaults `udp-echo:9001`)
 - `--tcp-total-mb` (alias: `--tcp-mb`)
 - `--udp-pps` (alias: `--udp-ps`)
+- `--udp-burst` (default `10`, max packets per pacing tick for UDP PPS test)
 - `--tcp-min-mbps` (default `1.0`, below threshold => TCP benchmark FAIL by quality)
 - `--udp-max-loss` (default `0.05` = 5%, above threshold => UDP benchmark FAIL by quality)
 - `--udp-max-jitter-ms` (default `50`, above threshold => UDP benchmark FAIL by quality)
@@ -341,6 +343,8 @@ Configured in `limits` section:
 - `relay_send_window_bytes`
 - `max_flows_per_session`
 - `max_udp_pps`
+- `session_datagram_workers`
+- `session_datagram_queue`
 - `max_bytes_per_minute_per_session`
 
 ## Observability
@@ -354,6 +358,11 @@ Configured in `limits` section:
 - `vlf_bytes_in_total{lane="relay|session"}`
 - `vlf_bytes_out_total{lane="relay|session"}`
 - `vlf_udp_pps`
+- `vlf_recv_datagrams_total`
+- `vlf_recv_bytes_total`
+- `vlf_dropped_datagrams_total{reason}`
+- `vlf_datagrams_processing_pps`
+- `vlf_datagram_queue_length`
 - `vlf_tcp_streams`
 - `vlf_auth_failures_total`
 - `vlf_replay_drops_total`
@@ -367,6 +376,8 @@ Identifiers included:
 
 - HTTP relay: `request_id`, `conn_id`
 - Session lane: `session_id`, `flow_id`
+
+With `log_level: debug`, session lane also prints per-second UDP datagram stats (processed dgrams/sec, queue length, drop reasons).
 
 ## Config
 

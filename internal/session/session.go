@@ -33,6 +33,18 @@ type udpFlow struct {
 	closeOnce sync.Once
 }
 
+type udpDatagramTask struct {
+	pkt DatagramPacket
+}
+
+const (
+	datagramDropQueueFull   = "queue_full"
+	datagramDropFlowMissing = "flow_not_found"
+	datagramDropBudget      = "budget"
+	datagramDropParseFail   = "parse_fail"
+	datagramDropWriteFail   = "udp_write_fail"
+)
+
 type Session struct {
 	id     uint64
 	conn   *quic.Conn
@@ -58,6 +70,16 @@ type Session struct {
 	flowsMu  sync.RWMutex
 	tcpFlows map[uint64]*tcpFlow
 	udpFlows map[uint64]*udpFlow
+
+	datagramQueues []chan udpDatagramTask
+	datagramQLen   atomic.Int64
+
+	udpProcessedSec  atomic.Uint64
+	udpDropQueueSec  atomic.Uint64
+	udpDropFlowSec   atomic.Uint64
+	udpDropBudgetSec atomic.Uint64
+	udpDropParseSec  atomic.Uint64
+	udpDropWriteSec  atomic.Uint64
 }
 
 func (s *Session) ID() uint64 {
@@ -137,10 +159,11 @@ func (s *Session) Run() error {
 	s.touch()
 	s.logger.Info("session authenticated", zap.String("client_id", s.clientID))
 
-	s.wg.Add(4)
+	s.startDatagramPipeline()
+
+	s.wg.Add(3)
 	go s.controlLoop()
 	go s.acceptFlowStreams()
-	go s.datagramLoop()
 	go s.pingLoop()
 
 	<-s.ctx.Done()
@@ -370,8 +393,44 @@ func (s *Session) pumpTCPFlow(flow *tcpFlow) {
 	s.closeFlow(flow.id, "tcp_flow_end", true)
 }
 
-func (s *Session) datagramLoop() {
+func (s *Session) startDatagramPipeline() {
+	workers := s.server.cfg.DatagramWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+	queueCap := s.server.cfg.DatagramQueue
+	if queueCap <= 0 {
+		queueCap = 1024
+	}
+	perWorker := queueCap / workers
+	if perWorker < 64 {
+		perWorker = 64
+	}
+
+	s.datagramQueues = make([]chan udpDatagramTask, workers)
+	for i := 0; i < workers; i++ {
+		ch := make(chan udpDatagramTask, perWorker)
+		s.datagramQueues[i] = ch
+		s.wg.Add(1)
+		go s.datagramWorkerLoop(ch)
+	}
+
+	s.wg.Add(1)
+	go s.datagramReadLoop()
+
+	if s.logger.Core().Enabled(zap.DebugLevel) {
+		s.wg.Add(1)
+		go s.datagramDebugLoop()
+	}
+}
+
+func (s *Session) datagramReadLoop() {
 	defer s.wg.Done()
+
+	workerCount := len(s.datagramQueues)
+	if workerCount == 0 {
+		return
+	}
 
 	for {
 		raw, err := s.conn.ReceiveDatagram(s.ctx)
@@ -386,41 +445,172 @@ func (s *Session) datagramLoop() {
 			return
 		}
 
-		pkt, err := DecodeDatagramPacket(raw)
-		if err != nil {
-			continue
-		}
-
+		s.server.metrics.ObserveRecvDatagram(len(raw))
 		s.touch()
 
+		pkt, err := DecodeDatagramPacket(raw)
+		if err != nil {
+			s.observeDatagramDrop(datagramDropParseFail, 0, err)
+			continue
+		}
+
 		if err := s.server.limits.AllowUDPPacket(s.id); err != nil {
+			s.observeDatagramDrop(datagramDropBudget, pkt.FlowID, err)
 			continue
 		}
 
-		payload, done := s.reassembly.Add(pkt)
-		if !done {
-			continue
+		queue := s.datagramQueues[int(pkt.FlowID%uint64(workerCount))]
+		select {
+		case queue <- udpDatagramTask{pkt: pkt}:
+			s.server.metrics.AddDatagramQueue(1)
+			s.datagramQLen.Add(1)
+		default:
+			s.observeDatagramDrop(datagramDropQueueFull, pkt.FlowID, nil)
 		}
+	}
+}
 
-		if err := s.server.limits.AllowSessionBytes(s.id, len(payload)); err != nil {
-			s.Close("session_bytes_limit")
+func (s *Session) datagramWorkerLoop(queue <-chan udpDatagramTask) {
+	defer s.wg.Done()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			s.drainDatagramQueue(queue, 20*time.Millisecond)
+			return
+		case task, ok := <-queue:
+			if !ok {
+				return
+			}
+			s.server.metrics.AddDatagramQueue(-1)
+			if s.datagramQLen.Add(-1) < 0 {
+				s.datagramQLen.Store(0)
+			}
+			s.processDatagramTask(task)
+		}
+	}
+}
+
+func (s *Session) drainDatagramQueue(queue <-chan udpDatagramTask, idleGrace time.Duration) {
+	timer := time.NewTimer(idleGrace)
+	defer timer.Stop()
+
+	for {
+		select {
+		case _, ok := <-queue:
+			if !ok {
+				return
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(idleGrace)
+			s.server.metrics.AddDatagramQueue(-1)
+			if s.datagramQLen.Add(-1) < 0 {
+				s.datagramQLen.Store(0)
+			}
+		case <-timer.C:
 			return
 		}
+	}
+}
 
-		s.flowsMu.RLock()
-		flow := s.udpFlows[pkt.FlowID]
-		s.flowsMu.RUnlock()
-		if flow == nil {
-			continue
+func (s *Session) processDatagramTask(task udpDatagramTask) {
+	pkt := task.pkt
+
+	payload, done := s.reassembly.Add(pkt)
+	if !done {
+		return
+	}
+
+	if err := s.server.limits.AllowSessionBytes(s.id, len(payload)); err != nil {
+		s.observeDatagramDrop(datagramDropBudget, pkt.FlowID, err)
+		s.Close("session_bytes_limit")
+		return
+	}
+
+	s.flowsMu.RLock()
+	flow := s.udpFlows[pkt.FlowID]
+	s.flowsMu.RUnlock()
+	if flow == nil {
+		s.observeDatagramDrop(datagramDropFlowMissing, pkt.FlowID, nil)
+		return
+	}
+
+	if _, err := flow.conn.Write(payload); err != nil {
+		s.observeDatagramDrop(datagramDropWriteFail, pkt.FlowID, err)
+		s.closeFlow(pkt.FlowID, "udp_write_failed", true)
+		return
+	}
+
+	s.server.metrics.BytesIn.WithLabelValues("session").Add(float64(len(payload)))
+	s.server.metrics.ObserveUDPPacket()
+	s.server.metrics.ObserveProcessedDatagram()
+	s.udpProcessedSec.Add(1)
+	s.touch()
+}
+
+func (s *Session) observeDatagramDrop(reason string, flowID uint64, err error) {
+	s.server.metrics.ObserveDroppedDatagram(reason)
+
+	switch reason {
+	case datagramDropQueueFull:
+		s.udpDropQueueSec.Add(1)
+	case datagramDropFlowMissing:
+		s.udpDropFlowSec.Add(1)
+	case datagramDropBudget:
+		s.udpDropBudgetSec.Add(1)
+	case datagramDropParseFail:
+		s.udpDropParseSec.Add(1)
+	case datagramDropWriteFail:
+		s.udpDropWriteSec.Add(1)
+	}
+
+	if reason == datagramDropParseFail && err != nil && s.logger.Core().Enabled(zap.DebugLevel) {
+		s.logger.Debug("failed to parse incoming datagram", zap.Error(err))
+	}
+	if reason == datagramDropWriteFail && err != nil && s.logger.Core().Enabled(zap.DebugLevel) {
+		s.logger.Debug("failed to write incoming datagram to UDP target", zap.Uint64("flow_id", flowID), zap.Error(err))
+	}
+}
+
+func (s *Session) datagramDebugLoop() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			processed := s.udpProcessedSec.Swap(0)
+			dropQueue := s.udpDropQueueSec.Swap(0)
+			dropFlow := s.udpDropFlowSec.Swap(0)
+			dropBudget := s.udpDropBudgetSec.Swap(0)
+			dropParse := s.udpDropParseSec.Swap(0)
+			dropWrite := s.udpDropWriteSec.Swap(0)
+			queueLen := s.datagramQLen.Load()
+
+			if processed == 0 && dropQueue == 0 && dropFlow == 0 && dropBudget == 0 && dropParse == 0 && dropWrite == 0 && queueLen == 0 {
+				continue
+			}
+
+			s.logger.Debug(
+				"session UDP datagram stats",
+				zap.Uint64("processed_dgrams_sec", processed),
+				zap.Int64("queue_len", queueLen),
+				zap.Uint64("drop_queue_full", dropQueue),
+				zap.Uint64("drop_flow_not_found", dropFlow),
+				zap.Uint64("drop_budget", dropBudget),
+				zap.Uint64("drop_parse_fail", dropParse),
+				zap.Uint64("drop_udp_write", dropWrite),
+			)
 		}
-
-		if _, err := flow.conn.Write(payload); err != nil {
-			s.closeFlow(pkt.FlowID, "udp_write_failed", true)
-			continue
-		}
-
-		s.server.metrics.BytesIn.WithLabelValues("session").Add(float64(len(payload)))
-		s.server.metrics.ObserveUDPPacket()
 	}
 }
 

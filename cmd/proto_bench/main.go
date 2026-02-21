@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -11,7 +12,9 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -35,6 +38,7 @@ type benchOptions struct {
 	TCPMinMbps     float64
 	UDPPPS         int
 	UDPPayload     int
+	UDPBurst       int
 	UDPMaxLoss     float64
 	UDPMaxJitterMS float64
 	TargetTCPHost  string
@@ -53,18 +57,19 @@ type benchOptions struct {
 }
 
 type benchReport struct {
-	StartedAt  time.Time           `json:"started_at"`
-	EndedAt    time.Time           `json:"ended_at"`
-	HostOS     string              `json:"host_os"`
-	HostArch   string              `json:"host_arch"`
-	Options    benchOptions        `json:"options"`
-	Config     map[string]any      `json:"config"`
-	TCP        tcpThroughputResult `json:"tcp_throughput"`
-	UDP        udpPPSResult        `json:"udp_pps"`
-	Concurrent concurrencyResult   `json:"concurrency"`
-	Fallback   fallbackResult      `json:"fallback"`
-	Soak       *soakResult         `json:"soak,omitempty"`
-	Errors     []string            `json:"errors,omitempty"`
+	StartedAt            time.Time           `json:"started_at"`
+	EndedAt              time.Time           `json:"ended_at"`
+	HostOS               string              `json:"host_os"`
+	HostArch             string              `json:"host_arch"`
+	Options              benchOptions        `json:"options"`
+	Config               map[string]any      `json:"config"`
+	ServerUDPDropReasons map[string]float64  `json:"server_udp_drop_reasons,omitempty"`
+	TCP                  tcpThroughputResult `json:"tcp_throughput"`
+	UDP                  udpPPSResult        `json:"udp_pps"`
+	Concurrent           concurrencyResult   `json:"concurrency"`
+	Fallback             fallbackResult      `json:"fallback"`
+	Soak                 *soakResult         `json:"soak,omitempty"`
+	Errors               []string            `json:"errors,omitempty"`
 }
 
 type tcpThroughputResult struct {
@@ -161,6 +166,7 @@ func main() {
 	flag.IntVar(&opts.UDPPPS, "udp-pps", 2000, "target packets per second for UDP PPS test")
 	flag.IntVar(&opts.UDPPPS, "udp-ps", 2000, "alias for --udp-pps")
 	flag.IntVar(&opts.UDPPayload, "udp-payload-bytes", 256, "UDP payload size in bytes")
+	flag.IntVar(&opts.UDPBurst, "udp-burst", 10, "max packets sent per pacing tick in UDP PPS test")
 	flag.Float64Var(&opts.UDPMaxLoss, "udp-max-loss", 0.05, "maximum allowed UDP loss ratio (0.05 = 5%)")
 	flag.Float64Var(&opts.UDPMaxJitterMS, "udp-max-jitter-ms", 50.0, "maximum allowed UDP jitter in milliseconds")
 	flag.StringVar(&opts.TargetTCPHost, "target-tcp-host", envOr("BENCH_TARGET_TCP_HOST", "tcp-echo"), "TCP benchmark target host")
@@ -205,6 +211,7 @@ func main() {
 			"disable_tcp":       baseCfg.DisableTCPSession,
 			"allow_relay":       baseCfg.AllowRelay,
 			"force_udp_block":   opts.ForceUDPBlock,
+			"udp_burst":         opts.UDPBurst,
 			"tcp_min_mbps":      opts.TCPMinMbps,
 			"udp_max_loss":      opts.UDPMaxLoss,
 			"udp_max_jitter_ms": opts.UDPMaxJitterMS,
@@ -266,6 +273,10 @@ func main() {
 	}
 	if fallbackRes.Fail > 0 {
 		report.Errors = append(report.Errors, fmt.Sprintf("fallback: fail=%d", fallbackRes.Fail))
+	}
+
+	if drops, err := scrapeServerUDPDropReasons(baseCfg); err == nil && len(drops) > 0 {
+		report.ServerUDPDropReasons = drops
 	}
 
 	if opts.Soak > 0 {
@@ -494,25 +505,48 @@ func runUDPPPS(cfg sessionclient.Config, opts benchOptions) udpPPSResult {
 	sent := int64(0)
 	start := time.Now()
 	end := start.Add(opts.Duration)
-	interval := time.Second / time.Duration(opts.UDPPPS)
-	nextTick := start
 	seq := uint32(1)
+	burst := opts.UDPBurst
+	if burst <= 0 {
+		burst = 1
+	}
+	ticksPerSecond := opts.UDPPPS / burst
+	ticksPerSecond = max(ticksPerSecond, 20)
+	ticksPerSecond = min(ticksPerSecond, 250)
+	tickInterval := time.Second / time.Duration(ticksPerSecond)
+	if tickInterval <= 0 {
+		tickInterval = time.Millisecond
+	}
+	tokensPerTick := float64(opts.UDPPPS) / float64(ticksPerSecond)
+	tokenBudget := 0.0
+	ticker := time.NewTicker(tickInterval)
+	defer ticker.Stop()
 
 	for time.Now().Before(end) {
-		payload := make([]byte, opts.UDPPayload)
-		binary.BigEndian.PutUint32(payload[:4], seq)
-		binary.BigEndian.PutUint64(payload[4:12], uint64(time.Now().UnixNano()))
-		fillPattern(payload[12:], byte(seq))
-
-		if err := udpFlow.Send(ctx, payload); err == nil {
-			sent++
+		<-ticker.C
+		tokenBudget += tokensPerTick
+		sendNow := int(tokenBudget)
+		if sendNow <= 0 {
+			continue
 		}
-		seq++
+		if sendNow > burst {
+			sendNow = burst
+		}
+		tokenBudget -= float64(sendNow)
 
-		nextTick = nextTick.Add(interval)
-		sleepFor := time.Until(nextTick)
-		if sleepFor > 0 {
-			time.Sleep(sleepFor)
+		for i := 0; i < sendNow; i++ {
+			if time.Now().After(end) {
+				break
+			}
+			payload := make([]byte, opts.UDPPayload)
+			binary.BigEndian.PutUint32(payload[:4], seq)
+			binary.BigEndian.PutUint64(payload[4:12], uint64(time.Now().UnixNano()))
+			fillPattern(payload[12:], byte(seq))
+
+			if err := udpFlow.Send(ctx, payload); err == nil {
+				sent++
+			}
+			seq++
 		}
 	}
 
@@ -875,6 +909,98 @@ func maybeStartMetrics(listen string) (*benchMetrics, error) {
 	return bm, nil
 }
 
+var droppedDatagramsRe = regexp.MustCompile(`^vlf_dropped_datagrams_total(?:\{([^}]*)\})?\s+([0-9eE+\-.]+)$`)
+
+func scrapeServerUDPDropReasons(cfg sessionclient.Config) (map[string]float64, error) {
+	metricsURL, err := metricsURLFromRelayBase(cfg.RelayBase)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, metricsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("metrics status: %s", resp.Status)
+	}
+
+	reasons := map[string]float64{}
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		matches := droppedDatagramsRe.FindStringSubmatch(line)
+		if len(matches) != 3 {
+			continue
+		}
+		labels := parsePromLabels(matches[1])
+		reason := labels["reason"]
+		if reason == "" {
+			reason = "unknown"
+		}
+		value, err := strconv.ParseFloat(matches[2], 64)
+		if err != nil {
+			continue
+		}
+		reasons[reason] = value
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return reasons, nil
+}
+
+func metricsURLFromRelayBase(relayBase string) (string, error) {
+	base := strings.TrimSpace(relayBase)
+	if base == "" {
+		return "", errors.New("empty relay base")
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	u.Path = "/metrics"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), nil
+}
+
+func parsePromLabels(raw string) map[string]string {
+	labels := map[string]string{}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return labels
+	}
+	parts := strings.Split(raw, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(kv[0])
+		val := strings.Trim(strings.TrimSpace(kv[1]), "\"")
+		if key != "" {
+			labels[key] = val
+		}
+	}
+	return labels
+}
+
 func printSummary(report benchReport) {
 	fmt.Println("\nVLF proto_bench summary")
 	fmt.Println("---------------------------------------------------------------")
@@ -894,6 +1020,9 @@ func printSummary(report benchReport) {
 	fmt.Printf("UDP loss/jitter: %.2f%% / %.2f ms\n", report.UDP.LossPercent, report.UDP.JitterMS)
 	fmt.Printf("Handshake p95/p99: %.2f / %.2f ms\n", report.Concurrent.HandshakeP95MS, report.Concurrent.HandshakeP99MS)
 	fmt.Printf("Fallback share: %v\n", report.Fallback.SharePercent)
+	if len(report.ServerUDPDropReasons) > 0 {
+		fmt.Printf("Server UDP drop reasons: %v\n", report.ServerUDPDropReasons)
+	}
 	if len(report.Errors) > 0 {
 		fmt.Printf("Errors: %s\n", strings.Join(report.Errors, " | "))
 	}
@@ -938,6 +1067,9 @@ func writeMarkdown(path string, report benchReport) error {
 	b.WriteString(fmt.Sprintf("- UDP loss/jitter: `%.2f%% / %.2f ms`\n", report.UDP.LossPercent, report.UDP.JitterMS))
 	b.WriteString(fmt.Sprintf("- Handshake p95/p99: `%.2f / %.2f ms`\n", report.Concurrent.HandshakeP95MS, report.Concurrent.HandshakeP99MS))
 	b.WriteString(fmt.Sprintf("- Fallback share: `%v`\n", report.Fallback.SharePercent))
+	if len(report.ServerUDPDropReasons) > 0 {
+		b.WriteString(fmt.Sprintf("- Server UDP drop reasons: `%v`\n", report.ServerUDPDropReasons))
+	}
 	if report.Fallback.Note != "" {
 		b.WriteString(fmt.Sprintf("- Fallback note: `%s`\n", report.Fallback.Note))
 	}

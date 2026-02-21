@@ -18,13 +18,20 @@ type Metrics struct {
 	BytesOut         *prometheus.CounterVec
 	UDPPackets       prometheus.Counter
 	UDPPPS           prometheus.Gauge
+	RecvDatagrams    prometheus.Counter
+	RecvBytes        prometheus.Counter
+	DroppedDatagrams *prometheus.CounterVec
+	DatagramProcPPS  prometheus.Gauge
+	DatagramQueueLen prometheus.Gauge
 	TCPStreams       prometheus.Gauge
 	AuthFailures     prometheus.Counter
 	ReplayDrops      prometheus.Counter
 	OpenFailures     *prometheus.CounterVec
 
-	udpPacketsSecond atomic.Uint64
-	stopCh           chan struct{}
+	udpPacketsSecond       atomic.Uint64
+	datagramProcSecond     atomic.Uint64
+	datagramQueueLenAtomic atomic.Int64
+	stopCh                 chan struct{}
 }
 
 func New() *Metrics {
@@ -56,6 +63,26 @@ func New() *Metrics {
 			Name: "vlf_udp_pps",
 			Help: "Current UDP packets per second",
 		}),
+		RecvDatagrams: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "vlf_recv_datagrams_total",
+			Help: "Total received QUIC datagrams on session lane",
+		}),
+		RecvBytes: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "vlf_recv_bytes_total",
+			Help: "Total received QUIC datagram bytes on session lane",
+		}),
+		DroppedDatagrams: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vlf_dropped_datagrams_total",
+			Help: "Dropped received QUIC datagrams by reason",
+		}, []string{"reason"}),
+		DatagramProcPPS: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "vlf_datagrams_processing_pps",
+			Help: "Current per-second processed datagrams on session lane",
+		}),
+		DatagramQueueLen: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "vlf_datagram_queue_length",
+			Help: "Current in-memory datagram queue length",
+		}),
 		TCPStreams: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "vlf_tcp_streams",
 			Help: "Active QUIC TCP streams",
@@ -82,6 +109,11 @@ func New() *Metrics {
 		m.BytesOut,
 		m.UDPPackets,
 		m.UDPPPS,
+		m.RecvDatagrams,
+		m.RecvBytes,
+		m.DroppedDatagrams,
+		m.DatagramProcPPS,
+		m.DatagramQueueLen,
 		m.TCPStreams,
 		m.AuthFailures,
 		m.ReplayDrops,
@@ -101,6 +133,8 @@ func (m *Metrics) ppsLoop() {
 		case <-ticker.C:
 			pps := m.udpPacketsSecond.Swap(0)
 			m.UDPPPS.Set(float64(pps))
+			proc := m.datagramProcSecond.Swap(0)
+			m.DatagramProcPPS.Set(float64(proc))
 		case <-m.stopCh:
 			return
 		}
@@ -114,6 +148,37 @@ func (m *Metrics) Handler() http.Handler {
 func (m *Metrics) ObserveUDPPacket() {
 	m.UDPPackets.Inc()
 	m.udpPacketsSecond.Add(1)
+}
+
+func (m *Metrics) ObserveRecvDatagram(sizeBytes int) {
+	m.RecvDatagrams.Inc()
+	if sizeBytes > 0 {
+		m.RecvBytes.Add(float64(sizeBytes))
+	}
+}
+
+func (m *Metrics) ObserveProcessedDatagram() {
+	m.datagramProcSecond.Add(1)
+}
+
+func (m *Metrics) ObserveDroppedDatagram(reason string) {
+	if reason == "" {
+		reason = "unknown"
+	}
+	m.DroppedDatagrams.WithLabelValues(reason).Inc()
+}
+
+func (m *Metrics) AddDatagramQueue(delta int64) {
+	current := m.datagramQueueLenAtomic.Add(delta)
+	if current < 0 {
+		m.datagramQueueLenAtomic.Store(0)
+		current = 0
+	}
+	m.DatagramQueueLen.Set(float64(current))
+}
+
+func (m *Metrics) DatagramQueueCurrent() int64 {
+	return m.datagramQueueLenAtomic.Load()
 }
 
 func (m *Metrics) Close() {

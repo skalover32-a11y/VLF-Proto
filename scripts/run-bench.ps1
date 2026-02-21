@@ -2,8 +2,8 @@
 Run proto_bench from Windows with native Go or Dockerized Go fallback.
 
 Examples:
-  .\scripts\run-bench.ps1 -- --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000 --tcp-min-mbps 1.0 --udp-max-loss 0.05 --udp-max-jitter-ms 50
-  .\scripts\run-bench.ps1 -- --clients 20 --duration 30s --tcp-total-mb 256 --udp-pps 2000 --metrics-listen :2112
+  .\scripts\run-bench.ps1 -- --clients 50 --duration 60s --tcp-mb 512 --udp-ps 5000 --udp-burst 10 --tcp-min-mbps 1.0 --udp-max-loss 0.05 --udp-max-jitter-ms 50
+  .\scripts\run-bench.ps1 -- --clients 20 --duration 30s --tcp-total-mb 256 --udp-pps 2000 --udp-burst 8 --metrics-listen :2112
 #>
 
 [CmdletBinding()]

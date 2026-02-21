@@ -31,6 +31,8 @@ type Config struct {
 	DownKbps        int
 	MaxUDPPPS       int
 	KeepAlive       time.Duration
+	DatagramWorkers int
+	DatagramQueue   int
 }
 
 type Server struct {
@@ -57,6 +59,13 @@ type managedSession interface {
 }
 
 func NewServer(cfg Config, verifier *auth.Verifier, lim *limits.Manager, m *metrics.Metrics, logger *zap.Logger) *Server {
+	if cfg.DatagramWorkers <= 0 {
+		cfg.DatagramWorkers = 4
+	}
+	if cfg.DatagramQueue <= 0 {
+		cfg.DatagramQueue = 4096
+	}
+
 	wheel := store.NewWheel(time.Second, 512)
 	return &Server{
 		cfg:      cfg,
