@@ -382,6 +382,9 @@ func main() {
 
 	dev, err := tun.CreateTUN(*tunNameFlag, *mtu)
 	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "wintun.dll") {
+			log.Fatalf("create wintun %q: %v; hint: place wintun.dll next to tun_client.exe or into C:\\Windows\\System32 (download: https://www.wintun.net/builds/wintun-0.14.1.zip)", *tunNameFlag, err)
+		}
 		log.Fatalf("create wintun %q: %v", *tunNameFlag, err)
 	}
 	cleanup.Add(func() {
