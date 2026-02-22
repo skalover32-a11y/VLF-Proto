@@ -71,7 +71,7 @@ type UDPFlow interface {
 func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	debugf(
 		cfg,
-		"dial config: host=%s quic_addr=%s tcp_addr=%s relay=%s proto_id=%s alpn=%v prefer_quic=%t disable_quic=%t disable_tcp=%t allow_relay=%t",
+		"dial config: host=%s quic_addr=%s tcp_addr=%s relay=%s proto_id=%s alpn=%v prefer_quic=%t disable_quic=%t disable_tcp=%t allow_relay=%t force_ipv4=%t",
 		cfg.GatewayHost,
 		cfg.QUICAddr(),
 		cfg.TCPAddr(),
@@ -82,6 +82,7 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 		cfg.DisableQUIC,
 		cfg.DisableTCPSession,
 		cfg.AllowRelay,
+		cfg.ForceIPv4,
 	)
 
 	var order []Transport

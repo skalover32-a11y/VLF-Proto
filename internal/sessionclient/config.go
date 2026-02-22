@@ -37,6 +37,7 @@ type Config struct {
 	DisableQUIC       bool
 	DisableTCPSession bool
 	AllowRelay        bool
+	ForceIPv4         bool
 	Debug             bool
 }
 
@@ -99,6 +100,7 @@ func LoadConfigFromEnv() (Config, error) {
 		DisableQUIC:       envBool("VLF_DISABLE_QUIC", false),
 		DisableTCPSession: envBool("VLF_DISABLE_TCP_SESSION", false),
 		AllowRelay:        !envBool("VLF_DISABLE_RELAY_FALLBACK", false),
+		ForceIPv4:         envBool("VLF_FORCE_IPV4", false),
 		Debug:             envBool("VLF_DEBUG", false),
 	}
 

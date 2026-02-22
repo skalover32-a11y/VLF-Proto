@@ -332,7 +332,7 @@ Run (Administrator PowerShell):
 
 ```powershell
 .\tun_client.exe --server <gateway-host> --port-udp 8443 --port-tcp 443 --mtu 1350 `
-  --dns-resolver 1.1.1.1:53 --udp-idle-timeout 60s
+  --dns-resolver 1.1.1.1:53 --udp-idle-timeout 60s --force-ipv4 true
 ```
 
 Port flags:
@@ -340,6 +340,7 @@ Port flags:
 - `--port-udp` for QUIC/UDP session lane.
 - `--port-tcp` for TCP session lane fallback.
 - legacy `--port` still works, but sets both ports to one value.
+- `--force-ipv4` (default `true`) forces gateway control dials over IPv4, which avoids IPv6 route blackholes in current IPv4-only TUN mode.
 
 What it configures:
 

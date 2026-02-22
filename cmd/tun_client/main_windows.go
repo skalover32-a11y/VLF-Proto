@@ -305,6 +305,7 @@ func main() {
 	disableQUIC := flag.Bool("disable-quic", baseCfg.DisableQUIC, "disable QUIC transport")
 	disableTCP := flag.Bool("disable-tcp-session", baseCfg.DisableTCPSession, "disable TCP session transport")
 	allowRelay := flag.Bool("allow-relay-fallback", baseCfg.AllowRelay, "allow HTTP relay fallback")
+	forceIPv4 := flag.Bool("force-ipv4", true, "force IPv4 for gateway session dials (recommended for IPv4 TUN mode)")
 	clientID := flag.String("client-id", "", "override client id")
 	secret := flag.String("secret", "", "override secret (plain or b64:...)")
 	debug := flag.Bool("debug", baseCfg.Debug, "enable sessionclient debug logs")
@@ -367,6 +368,7 @@ func main() {
 	cfg.DisableQUIC = *disableQUIC
 	cfg.DisableTCPSession = *disableTCP
 	cfg.AllowRelay = *allowRelay
+	cfg.ForceIPv4 = *forceIPv4
 	cfg.Debug = *debug
 
 	if *clientID != "" {
@@ -381,6 +383,9 @@ func main() {
 	}
 	if cfg.DisableTCPSession && !cfg.AllowRelay {
 		log.Printf("warning: running in QUIC-only mode (tcp session and relay fallback are disabled)")
+	}
+	if cfg.DisableQUIC {
+		log.Printf("warning: QUIC is disabled; UDP-heavy apps/calls (Discord/Telegram calls, games, voice/video) may fail or degrade")
 	}
 
 	gatewayIP, err := resolveGatewayIPv4(cfg.GatewayHost)

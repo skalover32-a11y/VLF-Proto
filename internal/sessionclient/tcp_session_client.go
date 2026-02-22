@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -63,8 +64,10 @@ func dialTCPSession(ctx context.Context, cfg Config) (*tcpSessionClient, error) 
 	}
 	debugf(cfg, "attempting TCP session dial: addr=%s sni=%s alpn=%v timeout=%s", cfg.TCPAddr(), tlsConf.ServerName, tlsConf.NextProtos, cfg.TCPTimeout)
 
-	dialer := &net.Dialer{Timeout: cfg.TCPTimeout}
-	conn, err := tls.DialWithDialer(dialer, "tcp", cfg.TCPAddr(), tlsConf)
+	dialCtx, cancelDial := context.WithTimeout(ctx, cfg.TCPTimeout)
+	defer cancelDial()
+
+	conn, err := dialTCPTLS(dialCtx, cfg, tlsConf)
 	if err != nil {
 		return nil, wrapErr("dial tcp session", err)
 	}
@@ -90,6 +93,72 @@ func dialTCPSession(ctx context.Context, cfg Config) (*tcpSessionClient, error) 
 
 	go c.readLoop()
 	return c, nil
+}
+
+func dialTCPTLS(ctx context.Context, cfg Config, tlsConf *tls.Config) (net.Conn, error) {
+	type dialTarget struct {
+		network string
+		addr    string
+	}
+
+	targets := make([]dialTarget, 0, 4)
+	appendTarget := func(network, addr string) {
+		if addr == "" {
+			return
+		}
+		targets = append(targets, dialTarget{network: network, addr: addr})
+	}
+
+	if cfg.ForceIPv4 {
+		host := cfg.GatewayHost
+		port := strconv.Itoa(cfg.GatewayTCP)
+
+		if ip := net.ParseIP(host); ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				appendTarget("tcp4", net.JoinHostPort(ip4.String(), port))
+			}
+		} else {
+			ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+			if err == nil {
+				for _, ip := range ips {
+					if ip4 := ip.To4(); ip4 != nil {
+						appendTarget("tcp4", net.JoinHostPort(ip4.String(), port))
+					}
+				}
+			} else {
+				debugf(cfg, "tcp ipv4 resolve failed for %s: %v", host, err)
+			}
+		}
+	}
+
+	appendTarget("tcp", cfg.TCPAddr())
+
+	dialer := &net.Dialer{}
+	var lastErr error
+	for _, target := range targets {
+		rawConn, err := dialer.DialContext(ctx, target.network, target.addr)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		tlsConn := tls.Client(rawConn, tlsConf)
+		if d, ok := ctx.Deadline(); ok {
+			_ = tlsConn.SetDeadline(d)
+		}
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = rawConn.Close()
+			lastErr = err
+			continue
+		}
+		_ = tlsConn.SetDeadline(time.Time{})
+		return tlsConn, nil
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("no dial targets available")
+	}
+	return nil, lastErr
 }
 
 func (c *tcpSessionClient) auth(ctx context.Context) error {
