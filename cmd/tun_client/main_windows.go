@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	gudp "gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 
 	"vlf-runtime/internal/auth"
@@ -187,6 +188,47 @@ type routeInfo struct {
 	NextHop        string `json:"NextHop"`
 }
 
+type udpOptions struct {
+	DNSResolverHost string
+	DNSResolverPort int
+	DNSOverride     bool
+	IdleTimeout     time.Duration
+}
+
+type udpFlowState struct {
+	key        string
+	srcIP      string
+	srcPort    int
+	dstIP      string
+	dstPort    int
+	targetHost string
+	targetPort int
+
+	local net.Conn
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	client  *sessionclient.Client
+	udpFlow sessionclient.UDPFlow
+	flowRef *flowState
+
+	lastActive atomic.Int64
+	closeOnce  sync.Once
+}
+
+type udpManager struct {
+	controller     *policyController
+	connectTimeout time.Duration
+	opts           udpOptions
+
+	mu    sync.Mutex
+	flows map[string]*udpFlowState
+
+	stopCh chan struct{}
+	doneCh chan struct{}
+}
+
 type cleanupStack struct {
 	mu  sync.Mutex
 	fns []func()
@@ -232,6 +274,9 @@ func main() {
 	serverPort := flag.Int("port", baseCfg.GatewayUDP, "gateway port for QUIC and TCP session lanes")
 	relayBase := flag.String("relay-base", baseCfg.RelayBase, "relay base URL (fallback)")
 	connectTimeout := flag.Duration("connect-timeout", 10*time.Second, "dial/open timeout per TCP flow")
+	udpIdleTimeout := flag.Duration("udp-idle-timeout", 60*time.Second, "UDP NAT idle timeout")
+	dnsResolver := flag.String("dns-resolver", "1.1.1.1:53", "upstream DNS resolver for intercepted UDP/53")
+	dnsOverride := flag.Bool("dns-override", true, "redirect all UDP/53 flows to dns-resolver")
 	modeRaw := flag.String("mode", "auto", "client mode: auto|normal|fast|survival")
 	statsFormatRaw := flag.String("stats-format", "text", "stats output format: text|json")
 	preferQUIC := flag.Bool("prefer-quic", baseCfg.PreferQUIC, "base prefer QUIC transport first")
@@ -257,6 +302,9 @@ func main() {
 	if *connectTimeout <= 0 {
 		*connectTimeout = 10 * time.Second
 	}
+	if *udpIdleTimeout <= 0 {
+		*udpIdleTimeout = 60 * time.Second
+	}
 	if net.ParseIP(*tunIP) == nil {
 		log.Fatalf("invalid --tun-ip=%s", *tunIP)
 	}
@@ -268,6 +316,10 @@ func main() {
 	}
 	if *mtu < 1200 || *mtu > 9000 {
 		log.Fatalf("invalid --mtu=%d (expected 1200..9000)", *mtu)
+	}
+	dnsHost, dnsPort, err := parseResolver(*dnsResolver)
+	if err != nil {
+		log.Fatalf("invalid --dns-resolver: %v", err)
 	}
 	if err := ensureElevated(); err != nil {
 		log.Fatalf("admin privileges required: %v", err)
@@ -367,11 +419,20 @@ func main() {
 	defer stop()
 
 	var wg sync.WaitGroup
-	if _, err := buildNetstack(ep, &wg, controller, *connectTimeout); err != nil {
+	udpMgr := newUDPManager(controller, *connectTimeout, udpOptions{
+		DNSResolverHost: dnsHost,
+		DNSResolverPort: dnsPort,
+		DNSOverride:     *dnsOverride,
+		IdleTimeout:     *udpIdleTimeout,
+	})
+	defer udpMgr.Close()
+
+	if _, err := buildNetstack(ep, &wg, controller, *connectTimeout, udpMgr); err != nil {
 		log.Fatalf("init netstack: %v", err)
 	}
 
-	log.Printf("TUN client started: if=%s ip=%s/%d gw=%s mtu=%d mode=%s stats=%s", tunName, *tunIP, *tunPrefix, *tunGateway, tunMTU, mode, sf)
+	log.Printf("TUN client started: if=%s ip=%s/%d gw=%s mtu=%d mode=%s stats=%s dns_override=%t dns_resolver=%s:%d udp_idle=%s",
+		tunName, *tunIP, *tunPrefix, *tunGateway, tunMTU, mode, sf, *dnsOverride, dnsHost, dnsPort, udpMgr.opts.IdleTimeout)
 	log.Printf("split routes active: 0.0.0.0/1 and 128.0.0.0/1 via %s; bypass for gateway %s via if=%d nh=%s",
 		*tunGateway, gatewayIP, route.InterfaceIndex, route.NextHop)
 
@@ -379,6 +440,7 @@ func main() {
 	log.Printf("shutdown signal received")
 
 	_ = dev.Close()
+	udpMgr.Close()
 	ep.Close()
 	ep.Wait()
 	wg.Wait()
@@ -597,13 +659,14 @@ func (t *tunReadWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func buildNetstack(ep stack.LinkEndpoint, wg *sync.WaitGroup, controller *policyController, connectTimeout time.Duration) (*stack.Stack, error) {
+func buildNetstack(ep stack.LinkEndpoint, wg *sync.WaitGroup, controller *policyController, connectTimeout time.Duration, udpMgr *udpManager) (*stack.Stack, error) {
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
 		},
 		TransportProtocols: []stack.TransportProtocolFactory{
 			tcp.NewProtocol,
+			gudp.NewProtocol,
 		},
 	})
 
@@ -647,6 +710,24 @@ func buildNetstack(ep stack.LinkEndpoint, wg *sync.WaitGroup, controller *policy
 		}()
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, forwarder.HandlePacket)
+
+	udpForwarder := gudp.NewForwarder(s, func(r *gudp.ForwarderRequest) {
+		id := r.ID()
+		var wq waiter.Queue
+
+		ep, err := r.CreateEndpoint(&wq)
+		if err != nil {
+			return
+		}
+		localConn := gonet.NewUDPConn(&wq, ep)
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			udpMgr.Handle(localConn, id)
+		}()
+	})
+	s.SetTransportProtocolHandler(gudp.ProtocolNumber, udpForwarder.HandlePacket)
 	return s, nil
 }
 
@@ -737,6 +818,314 @@ func handleTCPFromTun(local net.Conn, controller *policyController, connectTimeo
 	proxyBidirectional(local, flow, client, controller, fs)
 }
 
+func parseResolver(raw string) (string, int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", 0, errors.New("empty resolver")
+	}
+	host, portRaw, err := net.SplitHostPort(raw)
+	if err != nil {
+		if !strings.Contains(raw, ":") {
+			host = raw
+			portRaw = "53"
+		} else {
+			return "", 0, err
+		}
+	}
+	port, err := net.LookupPort("udp", portRaw)
+	if err != nil {
+		return "", 0, err
+	}
+	if host == "" {
+		return "", 0, errors.New("resolver host is empty")
+	}
+	return host, port, nil
+}
+
+func newUDPManager(controller *policyController, connectTimeout time.Duration, opts udpOptions) *udpManager {
+	if opts.IdleTimeout <= 0 {
+		opts.IdleTimeout = 60 * time.Second
+	}
+	m := &udpManager{
+		controller:     controller,
+		connectTimeout: connectTimeout,
+		opts:           opts,
+		flows:          make(map[string]*udpFlowState),
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
+	}
+	go m.janitorLoop()
+	return m
+}
+
+func (m *udpManager) Close() {
+	select {
+	case <-m.stopCh:
+	default:
+		close(m.stopCh)
+	}
+	<-m.doneCh
+
+	m.mu.Lock()
+	flows := make([]*udpFlowState, 0, len(m.flows))
+	for _, st := range m.flows {
+		flows = append(flows, st)
+	}
+	m.mu.Unlock()
+
+	for _, st := range flows {
+		m.closeState(st, "manager_close")
+	}
+}
+
+func (m *udpManager) janitorLoop() {
+	defer close(m.doneCh)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case now := <-ticker.C:
+			m.expireIdle(now)
+		}
+	}
+}
+
+func (m *udpManager) expireIdle(now time.Time) {
+	idleCutoff := now.Add(-m.opts.IdleTimeout).UnixNano()
+	var stale []*udpFlowState
+
+	m.mu.Lock()
+	for _, st := range m.flows {
+		if st.lastActive.Load() < idleCutoff {
+			stale = append(stale, st)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, st := range stale {
+		m.closeState(st, "udp_idle_timeout")
+	}
+}
+
+func (m *udpManager) Handle(local net.Conn, id stack.TransportEndpointID) {
+	srcIP := tcpipAddrToString(id.RemoteAddress)
+	dstIP := tcpipAddrToString(id.LocalAddress)
+	srcPort := int(id.RemotePort)
+	dstPort := int(id.LocalPort)
+	if srcIP == "" || dstIP == "" || srcPort <= 0 || dstPort <= 0 {
+		_ = local.Close()
+		return
+	}
+
+	key := fmt.Sprintf("%s:%d>%s:%d", srcIP, srcPort, dstIP, dstPort)
+
+	m.mu.Lock()
+	if _, exists := m.flows[key]; exists {
+		m.mu.Unlock()
+		_ = local.Close()
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	targetHost := dstIP
+	targetPort := dstPort
+	if m.opts.DNSOverride && dstPort == 53 {
+		targetHost = m.opts.DNSResolverHost
+		targetPort = m.opts.DNSResolverPort
+	}
+
+	st := &udpFlowState{
+		key:        key,
+		srcIP:      srcIP,
+		srcPort:    srcPort,
+		dstIP:      dstIP,
+		dstPort:    dstPort,
+		targetHost: targetHost,
+		targetPort: targetPort,
+		local:      local,
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+	st.lastActive.Store(time.Now().UnixNano())
+	m.flows[key] = st
+	m.mu.Unlock()
+
+	go m.runState(st)
+}
+
+func (m *udpManager) runState(st *udpFlowState) {
+	admissionCtx, cancelAdmission := context.WithTimeout(context.Background(), m.connectTimeout)
+	if err := m.controller.acquireFlowPermit(admissionCtx); err != nil {
+		cancelAdmission()
+		m.closeState(st, "udp_admission_denied")
+		return
+	}
+	cancelAdmission()
+	permitHeld := true
+
+	cfg, mode := m.controller.dialConfigUDP()
+	setupStart := time.Now()
+
+	dialCtx, cancel := context.WithTimeout(context.Background(), m.connectTimeout)
+	client, err := sessionclient.Dial(dialCtx, cfg)
+	cancel()
+	if err != nil {
+		if permitHeld {
+			m.controller.releaseFlowPermit()
+			permitHeld = false
+		}
+		m.controller.onDialError(cfg, err)
+		log.Printf("udp session dial failed mode=%s for %s:%d -> %s:%d target=%s:%d: %v",
+			mode, st.srcIP, st.srcPort, st.dstIP, st.dstPort, st.targetHost, st.targetPort, err)
+		m.closeState(st, "udp_dial_failed")
+		return
+	}
+	m.controller.onDialSuccess(mode, cfg, client.Transport())
+	st.client = client
+
+	openCtx, cancel := context.WithTimeout(context.Background(), m.connectTimeout)
+	udpFlow, err := client.OpenUDPFlow(openCtx, st.targetHost, st.targetPort)
+	cancel()
+	if err != nil {
+		if permitHeld {
+			m.controller.releaseFlowPermit()
+			permitHeld = false
+		}
+		m.controller.onTransportError("open_udp_flow_failed")
+		log.Printf("open udp flow failed mode=%s for %s:%d -> %s:%d target=%s:%d: %v",
+			mode, st.srcIP, st.srcPort, st.dstIP, st.dstPort, st.targetHost, st.targetPort, err)
+		m.closeState(st, "udp_open_failed")
+		return
+	}
+	st.udpFlow = udpFlow
+
+	fs := m.controller.registerFlow(client, client.Transport(), time.Since(setupStart))
+	st.flowRef = fs
+	permitHeld = false
+
+	log.Printf("tun udp %s:%d -> %s:%d target=%s:%d via %s mode=%s flow_id=%d",
+		st.srcIP, st.srcPort, st.dstIP, st.dstPort, st.targetHost, st.targetPort, client.Transport(), mode, fs.id)
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- m.localToRemote(st) }()
+	go func() { errCh <- m.remoteToLocal(st) }()
+
+	err = <-errCh
+	if !isExpectedUDPErr(err) {
+		m.controller.onTransportError("udp_pump_error")
+		log.Printf("udp pump ended with error key=%s: %v", st.key, err)
+	}
+	m.closeState(st, "udp_pump_end")
+}
+
+func (m *udpManager) localToRemote(st *udpFlowState) error {
+	buf := make([]byte, 64*1024)
+	for {
+		if err := st.local.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			return err
+		}
+		n, err := st.local.Read(buf)
+		if n > 0 {
+			payload := make([]byte, n)
+			copy(payload, buf[:n])
+
+			sendCtx, cancel := context.WithTimeout(st.ctx, m.connectTimeout)
+			sendErr := st.udpFlow.Send(sendCtx, payload)
+			cancel()
+			if sendErr != nil {
+				return sendErr
+			}
+
+			if st.flowRef != nil {
+				st.flowRef.upBytes.Add(int64(n))
+				m.controller.totalUpBytes.Add(int64(n))
+			}
+			st.lastActive.Store(time.Now().UnixNano())
+		}
+		if err != nil {
+			if isTimeoutErr(err) {
+				select {
+				case <-st.ctx.Done():
+					return nil
+				default:
+					continue
+				}
+			}
+			if isExpectedUDPErr(err) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func (m *udpManager) remoteToLocal(st *udpFlowState) error {
+	for {
+		recvCtx, cancel := context.WithTimeout(st.ctx, 2*time.Second)
+		payload, err := st.udpFlow.Recv(recvCtx)
+		cancel()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				select {
+				case <-st.ctx.Done():
+					return nil
+				default:
+					continue
+				}
+			}
+			if isExpectedUDPErr(err) {
+				return nil
+			}
+			return err
+		}
+		if len(payload) == 0 {
+			continue
+		}
+
+		if err := st.local.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			return err
+		}
+		if _, err := st.local.Write(payload); err != nil {
+			if isExpectedUDPErr(err) {
+				return nil
+			}
+			return err
+		}
+
+		if st.flowRef != nil {
+			st.flowRef.downBytes.Add(int64(len(payload)))
+			m.controller.totalDownBytes.Add(int64(len(payload)))
+		}
+		st.lastActive.Store(time.Now().UnixNano())
+	}
+}
+
+func (m *udpManager) closeState(st *udpFlowState, reason string) {
+	st.closeOnce.Do(func() {
+		st.cancel()
+		if st.local != nil {
+			_ = st.local.Close()
+		}
+		if st.udpFlow != nil {
+			_ = st.udpFlow.Close()
+		}
+		if st.client != nil {
+			_ = st.client.Close()
+		}
+		if st.flowRef != nil {
+			m.controller.unregisterFlow(st.flowRef.id)
+		}
+
+		m.mu.Lock()
+		delete(m.flows, st.key)
+		m.mu.Unlock()
+		log.Printf("closed udp flow key=%s reason=%s", st.key, reason)
+	})
+}
+
 func parseMode(raw string) (clientMode, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case string(modeAuto):
@@ -810,6 +1199,15 @@ func (c *policyController) dialConfig() (sessionclient.Config, clientMode) {
 	mode := c.currentMode
 	c.mu.Unlock()
 	return c.configForMode(mode), mode
+}
+
+func (c *policyController) dialConfigUDP() (sessionclient.Config, clientMode) {
+	cfg, mode := c.dialConfig()
+	cfg.PreferQUIC = true
+	cfg.DisableQUIC = false
+	cfg.DisableTCPSession = true
+	cfg.AllowRelay = false
+	return cfg, mode
 }
 
 func (c *policyController) configForMode(mode clientMode) sessionclient.Config {
@@ -1434,4 +1832,25 @@ func isExpectedProbeErr(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "application error 0x0") || strings.Contains(msg, "stream reset")
+}
+
+func isExpectedUDPErr(err error) bool {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	if isTimeoutErr(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "closed pipe") ||
+		strings.Contains(msg, "application error 0x0")
+}
+
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }

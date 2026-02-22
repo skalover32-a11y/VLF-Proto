@@ -299,16 +299,22 @@ QUIC-blocked simulation:
 ./socks_client --server <gateway-host> --port 443 --mode auto --disable-quic
 ```
 
-## TUN Mode Stage 1 (Windows, TCP only)
+## TUN Mode (Windows, Stages 1-3)
 
-`cmd/tun_client` adds full-system TCP tunneling via Wintun + gVisor netstack.
+`cmd/tun_client` provides full-system tunneling via Wintun + gVisor netstack.
 
-Stage 1 scope:
+Implemented stages:
+
+- Stage 1: IPv4 TCP interception from TUN to VLF TCP flows.
+- Stage 2: DNS interception (`UDP/53`) with upstream resolver forwarding.
+- Stage 3: general UDP interception with per-flow NAT table and idle cleanup.
+
+Current scope:
 
 - Windows only
-- IPv4 only
-- TCP only (no DNS/UDP interception yet)
-- policy stack is the same as SOCKS client:
+- IPv4 TUN path
+- TCP + UDP via VLF session lane
+- policy stack matches SOCKS client:
   - `--mode auto|normal|fast|survival`
   - RTT probe every `1s`
   - adaptive concurrency caps in `auto`
@@ -323,10 +329,11 @@ go build ./cmd/tun_client
 Run (Administrator PowerShell):
 
 ```powershell
-.\tun_client.exe --server <gateway-host> --port 443 --mtu 1350
+.\tun_client.exe --server <gateway-host> --port 443 --mtu 1350 `
+  --dns-resolver 1.1.1.1:53 --udp-idle-timeout 60s
 ```
 
-What Stage 1 configures:
+What it configures:
 
 - creates/reuses Wintun interface (`--tun-name`, default `VLF-TUN`)
 - sets IPv4 address `198.18.0.2/15` and gateway `198.18.0.1`
@@ -335,13 +342,25 @@ What Stage 1 configures:
   - `128.0.0.0/1` via `198.18.0.1`
 - adds explicit `/32` bypass route for resolved gateway server IP through the original route to avoid routing loops
 - on shutdown (Ctrl+C), removes added routes and interface IP settings
+- DNS behavior:
+  - with `--dns-override=true` (default), all intercepted UDP/53 is forwarded to `--dns-resolver` (default `1.1.1.1:53`)
+- UDP behavior:
+  - per-flow NAT mapping (5-tuple based)
+  - reverse path from VLF UDP flow back into TUN
+  - idle timeout via `--udp-idle-timeout` (default `60s`)
 
 Validation:
 
 1. Start `tun_client` as Administrator.
 2. Open Edge (no proxy settings).
 3. Navigate to `https://api.ipify.org`.
-4. Expected: returned IP matches gateway egress IP.
+4. Run `nslookup example.com`.
+5. Optional UDP check (PowerShell):
+   `Test-NetConnection -ComputerName 1.1.1.1 -Port 53 -InformationLevel Detailed`
+6. Expected:
+   - ipify returns gateway egress IP
+   - DNS queries resolve successfully
+   - UDP applications can exchange traffic through the tunnel
 
 Troubleshooting:
 
@@ -351,7 +370,10 @@ Troubleshooting:
 - If QUIC is blocked in the network, run with fallback preference:
   - `.\tun_client.exe --server <gateway-host> --port 443 --mode auto --disable-quic`
 - If interface creation fails, verify Wintun driver installation and endpoint security software policies.
-- Stage 1 does not tunnel UDP/DNS yet; DNS/UDP support is planned for later stages.
+- If DNS fails, explicitly set resolver and keep override enabled:
+  - `.\tun_client.exe --dns-resolver 1.1.1.1:53 --dns-override true`
+- If UDP apps are unstable, increase idle timeout:
+  - `.\tun_client.exe --udp-idle-timeout 120s`
 
 ## Relay lane API v0.1
 
