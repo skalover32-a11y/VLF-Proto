@@ -17,6 +17,10 @@ type Metrics struct {
 	BytesIn          *prometheus.CounterVec
 	BytesOut         *prometheus.CounterVec
 	UDPPackets       prometheus.Counter
+	UDPForwarded     prometheus.Counter
+	UDPDstRX         prometheus.Counter
+	UDPToClient      prometheus.Counter
+	UDPToClientFail  prometheus.Counter
 	UDPPPS           prometheus.Gauge
 	RecvDatagrams    prometheus.Counter
 	RecvBytes        prometheus.Counter
@@ -57,11 +61,27 @@ func New() *Metrics {
 		}, []string{"lane"}),
 		UDPPackets: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "vlf_udp_packets_total",
-			Help: "Total UDP datagrams forwarded in session lane",
+			Help: "Deprecated alias of vlf_udp_forwarded_total",
+		}),
+		UDPForwarded: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "vlf_udp_forwarded_total",
+			Help: "Total UDP datagrams forwarded from client to destination in session lane",
+		}),
+		UDPDstRX: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "vlf_udp_dst_rx_total",
+			Help: "Total UDP datagrams read from destination sockets in session lane",
+		}),
+		UDPToClient: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "vlf_udp_to_client_total",
+			Help: "Total UDP datagrams sent from gateway back to client over QUIC DATAGRAM",
+		}),
+		UDPToClientFail: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "vlf_udp_to_client_fail_total",
+			Help: "Total UDP datagrams failed to send from gateway to client over QUIC DATAGRAM",
 		}),
 		UDPPPS: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "vlf_udp_pps",
-			Help: "Current UDP packets per second",
+			Help: "Current UDP forwarded packets per second (client to destination)",
 		}),
 		RecvDatagrams: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "vlf_recv_datagrams_total",
@@ -108,6 +128,10 @@ func New() *Metrics {
 		m.BytesIn,
 		m.BytesOut,
 		m.UDPPackets,
+		m.UDPForwarded,
+		m.UDPDstRX,
+		m.UDPToClient,
+		m.UDPToClientFail,
 		m.UDPPPS,
 		m.RecvDatagrams,
 		m.RecvBytes,
@@ -146,8 +170,26 @@ func (m *Metrics) Handler() http.Handler {
 }
 
 func (m *Metrics) ObserveUDPPacket() {
+	m.ObserveUDPForwarded()
+}
+
+func (m *Metrics) ObserveUDPForwarded() {
+	// Keep old metric for backward compatibility.
 	m.UDPPackets.Inc()
+	m.UDPForwarded.Inc()
 	m.udpPacketsSecond.Add(1)
+}
+
+func (m *Metrics) ObserveUDPDstRX() {
+	m.UDPDstRX.Inc()
+}
+
+func (m *Metrics) ObserveUDPToClient() {
+	m.UDPToClient.Inc()
+}
+
+func (m *Metrics) ObserveUDPToClientFail() {
+	m.UDPToClientFail.Inc()
 }
 
 func (m *Metrics) ObserveRecvDatagram(sizeBytes int) {
@@ -166,6 +208,13 @@ func (m *Metrics) ObserveDroppedDatagram(reason string) {
 		reason = "unknown"
 	}
 	m.DroppedDatagrams.WithLabelValues(reason).Inc()
+}
+
+func (m *Metrics) EnsureDroppedDatagramReason(reason string) {
+	if reason == "" {
+		reason = "unknown"
+	}
+	m.DroppedDatagrams.WithLabelValues(reason)
 }
 
 func (m *Metrics) AddDatagramQueue(delta int64) {

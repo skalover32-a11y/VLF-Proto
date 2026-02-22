@@ -357,6 +357,11 @@ Configured in `limits` section:
 - `vlf_active_relay_conns`
 - `vlf_bytes_in_total{lane="relay|session"}`
 - `vlf_bytes_out_total{lane="relay|session"}`
+- `vlf_udp_forwarded_total`
+- `vlf_udp_packets_total` (backward-compatible alias of `vlf_udp_forwarded_total`)
+- `vlf_udp_dst_rx_total`
+- `vlf_udp_to_client_total`
+- `vlf_udp_to_client_fail_total`
 - `vlf_udp_pps`
 - `vlf_recv_datagrams_total`
 - `vlf_recv_bytes_total`
