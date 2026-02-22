@@ -306,7 +306,7 @@ func main() {
 	serverPortLegacy := flag.Int("port", 0, "deprecated: gateway port for both QUIC and TCP session lanes")
 	serverPortUDP := flag.Int("port-udp", baseCfg.GatewayUDP, "gateway QUIC/UDP port")
 	serverPortTCP := flag.Int("port-tcp", baseCfg.GatewayTCP, "gateway TCP session port")
-	relayBase := flag.String("relay-base", baseCfg.RelayBase, "relay base URL (fallback)")
+	relayBase := flag.String("relay-base", "", "relay base URL (fallback); default http://<gateway-ip>:8080")
 	connectTimeout := flag.Duration("connect-timeout", 10*time.Second, "dial/open timeout per TCP flow")
 	udpIdleTimeout := flag.Duration("udp-idle-timeout", 60*time.Second, "UDP NAT idle timeout")
 	dnsResolver := flag.String("dns-resolver", "1.1.1.1:53", "upstream DNS resolver for intercepted UDP/53")
@@ -368,6 +368,8 @@ func main() {
 
 	cfg := baseCfg
 	cfg.GatewayHost = *serverHost
+	cfg.GatewayDialHost = cfg.GatewayHost
+	cfg.TLSServerName = cfg.GatewayHost
 	cfg.GatewayUDP = *serverPortUDP
 	cfg.GatewayTCP = *serverPortTCP
 	if *serverPortLegacy > 0 {
@@ -375,7 +377,6 @@ func main() {
 		cfg.GatewayTCP = *serverPortLegacy
 		log.Printf("warning: --port is deprecated; use --port-udp/--port-tcp for split transport ports")
 	}
-	cfg.RelayBase = *relayBase
 	cfg.PreferQUIC = *preferQUIC
 	cfg.DisableQUIC = *disableQUIC
 	cfg.DisableTCPSession = *disableTCP
@@ -404,6 +405,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("resolve gateway host %q: %v", cfg.GatewayHost, err)
 	}
+	cfg.GatewayDialHost = gatewayIP
+	if strings.TrimSpace(*relayBase) != "" {
+		cfg.RelayBase = strings.TrimSpace(*relayBase)
+	} else {
+		cfg.RelayBase = defaultRelayBase(cfg.GatewayDialHost)
+	}
 	route, err := findBestRouteTo(gatewayIP)
 	if err != nil {
 		log.Fatalf("find route to gateway ip %s: %v", gatewayIP, err)
@@ -413,7 +420,7 @@ func main() {
 	}
 
 	log.Printf("gateway resolved: host=%s ip=%s route_if=%d route_nexthop=%s", cfg.GatewayHost, gatewayIP, route.InterfaceIndex, route.NextHop)
-	log.Printf("gateway transport ports: quic_udp=%d tcp_session=%d", cfg.GatewayUDP, cfg.GatewayTCP)
+	log.Printf("gateway transport ports: quic_udp=%d tcp_session=%d relay=%s tls_sni=%s", cfg.GatewayUDP, cfg.GatewayTCP, cfg.RelayBase, cfg.TLSServerName)
 
 	controller := newPolicyController(cfg, mode, sf)
 	defer controller.Close()
@@ -969,6 +976,14 @@ func parseResolver(raw string) (string, int, error) {
 		return "", 0, errors.New("resolver host is empty")
 	}
 	return host, port, nil
+}
+
+func defaultRelayBase(host string) string {
+	h := strings.TrimSpace(host)
+	if h == "" {
+		h = "localhost"
+	}
+	return "http://" + net.JoinHostPort(h, "8080")
 }
 
 func newUDPManager(controller *policyController, connectTimeout time.Duration, opts udpOptions) *udpManager {

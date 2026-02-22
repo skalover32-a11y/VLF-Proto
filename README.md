@@ -249,7 +249,7 @@ go build ./cmd/socks_client
 Run:
 
 ```bash
-./socks_client --server <gateway-host> --port-udp 8443 --port-tcp 443
+./socks_client --server <gateway-host> --server-ip <gateway-ip> --tls-server-name <gateway-host> --port-udp 8443 --port-tcp 443
 ```
 
 Auth flags:
@@ -262,6 +262,14 @@ UDP flags:
 - `--udp-idle-timeout` (default `60s`)
 - `--udp-max-associations` (default `128`)
 - `--udp-max-nat` (default `4096`)
+
+Gateway dial flags:
+
+- `--server` logical gateway host (used for SNI by default)
+- `--server-ip` optional direct dial IP/host override (recommended with sing-box TUN to avoid DNS loops)
+- `--tls-server-name` optional SNI override
+- `--resolve-once` (default `true`) resolves `--server` once at startup and pins the dial host
+- if `--relay-base` is not specified, default is `http://<dial-host>:8080`
 
 Metrics:
 
@@ -358,8 +366,16 @@ Run `socks_client` with matching auth:
 
 ```bash
 ./socks_client --listen 127.0.0.1:1080 --auth userpass --username vlf --password vlfpass \
-  --server <gateway-host> --port-udp 8443 --port-tcp 443 --mode auto
+  --server <gateway-host> --server-ip <gateway-ip> --tls-server-name <gateway-host> \
+  --port-udp 8443 --port-tcp 443 --mode auto
 ```
+
+Troubleshooting for sing-box TUN (`no internet`, repeated UDP to `172.19.0.2:53`):
+
+1. Ensure `socks_client` is running before `sing-box` and listening on `127.0.0.1:1080`.
+2. Use `--server-ip <gateway-ip>` to avoid runtime DNS recursion through TUN.
+3. In sing-box routing, keep gateway host/IP and `socks_client.exe` on `direct` detour to avoid loopback recursion.
+4. Configure sing-box DNS explicitly; if DNS packets to `172.19.0.2:53` are forwarded into SOCKS, DNS will fail.
 
 ## TUN Mode (Windows, Stages 1-3)
 
@@ -410,6 +426,7 @@ What it configures:
   - `0.0.0.0/1` via `198.18.0.1`
   - `128.0.0.0/1` via `198.18.0.1`
 - adds explicit `/32` bypass route for resolved gateway server IP through the original route to avoid routing loops
+- session dials are pinned to the resolved gateway IP (SNI stays `--server`), so runtime DNS outages do not break active tunneling
 - on shutdown (Ctrl+C), removes added routes and interface IP settings
 - DNS behavior:
   - with `--dns-override=true` (default), all intercepted UDP/53 is forwarded to `--dns-resolver` (default `1.1.1.1:53`)

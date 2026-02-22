@@ -286,10 +286,13 @@ func main() {
 
 	listenAddr := flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address")
 	serverHost := flag.String("server", baseCfg.GatewayHost, "gateway host")
+	serverIP := flag.String("server-ip", "", "optional gateway dial IP/host override (avoids local DNS loop)")
+	tlsServerName := flag.String("tls-server-name", "", "optional TLS SNI override (default: --server)")
+	resolveOnce := flag.Bool("resolve-once", true, "resolve --server once at startup and pin dial host for runtime")
 	serverPortLegacy := flag.Int("port", 0, "deprecated: gateway port for both QUIC and TCP session lanes")
 	serverPortUDP := flag.Int("port-udp", baseCfg.GatewayUDP, "gateway QUIC/UDP port")
 	serverPortTCP := flag.Int("port-tcp", baseCfg.GatewayTCP, "gateway TCP session port")
-	relayBase := flag.String("relay-base", baseCfg.RelayBase, "relay base URL (fallback)")
+	relayBase := flag.String("relay-base", "", "relay base URL (fallback); default http://<dial-host>:8080")
 	connectTimeout := flag.Duration("connect-timeout", 10*time.Second, "dial/open timeout per CONNECT")
 	udpIdleTimeout := flag.Duration("udp-idle-timeout", 60*time.Second, "UDP NAT idle timeout for SOCKS UDP ASSOCIATE")
 	udpMaxAssociations := flag.Int("udp-max-associations", 128, "max concurrent UDP associations")
@@ -345,6 +348,8 @@ func main() {
 
 	cfg := baseCfg
 	cfg.GatewayHost = *serverHost
+	cfg.GatewayDialHost = cfg.GatewayHost
+	cfg.TLSServerName = cfg.GatewayHost
 	cfg.GatewayUDP = *serverPortUDP
 	cfg.GatewayTCP = *serverPortTCP
 	if *serverPortLegacy > 0 {
@@ -352,7 +357,25 @@ func main() {
 		cfg.GatewayTCP = *serverPortLegacy
 		log.Printf("warning: --port is deprecated; use --port-udp/--port-tcp for split transport ports")
 	}
-	cfg.RelayBase = *relayBase
+	if host := strings.TrimSpace(*serverIP); host != "" {
+		cfg.GatewayDialHost = host
+	}
+	if sni := strings.TrimSpace(*tlsServerName); sni != "" {
+		cfg.TLSServerName = sni
+	}
+	if *resolveOnce && strings.TrimSpace(*serverIP) == "" {
+		if resolved, resolveErr := resolveDialHost(cfg.GatewayHost, cfg.ForceIPv4, 3*time.Second); resolveErr != nil {
+			log.Printf("warning: gateway resolve-once failed for host=%s: %v (will use runtime resolver)", cfg.GatewayHost, resolveErr)
+		} else {
+			cfg.GatewayDialHost = resolved
+			log.Printf("gateway resolve-once host=%s dial_host=%s", cfg.GatewayHost, cfg.GatewayDialHost)
+		}
+	}
+	if rb := strings.TrimSpace(*relayBase); rb != "" {
+		cfg.RelayBase = rb
+	} else {
+		cfg.RelayBase = defaultRelayBase(cfg.GatewayDialHost)
+	}
 	cfg.PreferQUIC = *preferQUIC
 	cfg.DisableQUIC = *disableQUIC
 	cfg.DisableTCPSession = *disableTCP
@@ -396,8 +419,8 @@ func main() {
 	log.Printf("SOCKS5 listening on %s", *listenAddr)
 	log.Printf("SOCKS auth mode=%s udp_idle_timeout=%s udp_max_associations=%d udp_max_nat=%d",
 		authCfg.mode, *udpIdleTimeout, *udpMaxAssociations, *udpMaxNAT)
-	log.Printf("Gateway host=%s quic_udp=%d tcp_session=%d mode=%s base_prefer_quic=%t base_disable_quic=%t disable_tcp=%t allow_relay=%t",
-		cfg.GatewayHost, cfg.GatewayUDP, cfg.GatewayTCP, mode, cfg.PreferQUIC, cfg.DisableQUIC, cfg.DisableTCPSession, cfg.AllowRelay)
+	log.Printf("Gateway host=%s dial_host=%s tls_sni=%s quic_udp=%d tcp_session=%d relay=%s mode=%s base_prefer_quic=%t base_disable_quic=%t disable_tcp=%t allow_relay=%t",
+		cfg.GatewayHost, cfg.GatewayDialHost, cfg.TLSServerName, cfg.GatewayUDP, cfg.GatewayTCP, cfg.RelayBase, mode, cfg.PreferQUIC, cfg.DisableQUIC, cfg.DisableTCPSession, cfg.AllowRelay)
 
 	var wg sync.WaitGroup
 	for {
@@ -2187,6 +2210,60 @@ func isExpectedUDPErr(err error) bool {
 	return strings.Contains(msg, "use of closed network connection") ||
 		strings.Contains(msg, "closed pipe") ||
 		strings.Contains(msg, "application error 0x0")
+}
+
+func defaultRelayBase(host string) string {
+	h := strings.TrimSpace(host)
+	if h == "" {
+		h = "localhost"
+	}
+	return "http://" + net.JoinHostPort(h, "8080")
+}
+
+func resolveDialHost(host string, forceIPv4 bool, timeout time.Duration) (string, error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", errors.New("empty gateway host")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if forceIPv4 {
+			if ip4 := ip.To4(); ip4 == nil {
+				return "", fmt.Errorf("force-ipv4 enabled but host %q resolved to non-ipv4", host)
+			}
+		}
+		return ip.String(), nil
+	}
+
+	lookupNet := "ip"
+	if forceIPv4 {
+		lookupNet = "ip4"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ips, err := net.DefaultResolver.LookupIP(ctx, lookupNet, host)
+	if err != nil {
+		return "", err
+	}
+	if len(ips) == 0 {
+		return "", fmt.Errorf("no DNS records for %q", host)
+	}
+
+	if forceIPv4 {
+		for _, ip := range ips {
+			if ip4 := ip.To4(); ip4 != nil {
+				return ip4.String(), nil
+			}
+		}
+		return "", fmt.Errorf("no ipv4 records for %q", host)
+	}
+
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4.String(), nil
+		}
+	}
+	return ips[0].String(), nil
 }
 
 func isTimeoutErr(err error) bool {

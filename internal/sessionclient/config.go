@@ -18,16 +18,20 @@ import (
 )
 
 type Config struct {
-	GatewayHost string
-	GatewayUDP  int
-	GatewayTCP  int
-	RelayBase   string
+	GatewayHost     string
+	GatewayDialHost string
+	GatewayUDP      int
+	GatewayTCP      int
+	RelayBase       string
 
 	ClientID string
 	Secret   []byte
 	ProtoID  string
 	ProtoIDs []string
 	PinSPKI  string
+	// TLSServerName is used for SNI / certificate pinning context.
+	// If empty, GatewayHost is used.
+	TLSServerName string
 
 	MaxDgramPayload int
 	QUICTimeout     time.Duration
@@ -77,21 +81,29 @@ func LoadConfigFromEnv() (Config, error) {
 	if gatewayHost == "" {
 		gatewayHost = "localhost"
 	}
+	gatewayDialHost := envAny([]string{"GATEWAY_DIAL_HOST", "GATEWAY_IP"}, gatewayHost)
+	tlsServerName := envOr("VLF_TLS_SERVER_NAME", gatewayHost)
 
 	gatewayUDP := envOrInt("GATEWAY_PORT_UDP", defaultPort)
 	gatewayTCP := envOrInt("GATEWAY_PORT_TCP", defaultPort)
-	relayBase := envOr("RELAY_BASE", fmt.Sprintf("http://%s:8080", gatewayHost))
+	relayHost := gatewayDialHost
+	if relayHost == "" {
+		relayHost = gatewayHost
+	}
+	relayBase := envOr("RELAY_BASE", "http://"+net.JoinHostPort(relayHost, "8080"))
 
 	cfg := Config{
-		GatewayHost: gatewayHost,
-		GatewayUDP:  gatewayUDP,
-		GatewayTCP:  gatewayTCP,
-		RelayBase:   relayBase,
-		ClientID:    clientID,
-		Secret:      secret,
-		ProtoID:     protoIDs[0],
-		ProtoIDs:    protoIDs,
-		PinSPKI:     pin,
+		GatewayHost:     gatewayHost,
+		GatewayDialHost: gatewayDialHost,
+		GatewayUDP:      gatewayUDP,
+		GatewayTCP:      gatewayTCP,
+		RelayBase:       relayBase,
+		ClientID:        clientID,
+		Secret:          secret,
+		ProtoID:         protoIDs[0],
+		ProtoIDs:        protoIDs,
+		PinSPKI:         pin,
+		TLSServerName:   tlsServerName,
 
 		MaxDgramPayload:   envOrInt("MAX_DGRAM_PAYLOAD", 1200),
 		QUICTimeout:       time.Duration(envOrInt("QUIC_CONNECT_TIMEOUT_MS", 1800)) * time.Millisecond,
@@ -115,11 +127,19 @@ func LoadConfigFromEnv() (Config, error) {
 }
 
 func (c Config) QUICAddr() string {
-	return net.JoinHostPort(c.GatewayHost, strconv.Itoa(c.GatewayUDP))
+	host := c.GatewayDialHost
+	if host == "" {
+		host = c.GatewayHost
+	}
+	return net.JoinHostPort(host, strconv.Itoa(c.GatewayUDP))
 }
 
 func (c Config) TCPAddr() string {
-	return net.JoinHostPort(c.GatewayHost, strconv.Itoa(c.GatewayTCP))
+	host := c.GatewayDialHost
+	if host == "" {
+		host = c.GatewayHost
+	}
+	return net.JoinHostPort(host, strconv.Itoa(c.GatewayTCP))
 }
 
 func (c Config) TLSConfig() (*tls.Config, error) {
@@ -128,9 +148,17 @@ func (c Config) TLSConfig() (*tls.Config, error) {
 		alpn = buildProtoIDList(c.ProtoID, nil)
 	}
 
+	serverName := c.TLSServerName
+	if serverName == "" {
+		serverName = c.GatewayHost
+	}
+	if serverName == "" {
+		serverName = c.GatewayDialHost
+	}
+
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
-		ServerName:         c.GatewayHost,
+		ServerName:         serverName,
 		MinVersion:         tls.VersionTLS13,
 		NextProtos:         alpn,
 	}
