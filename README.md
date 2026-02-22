@@ -217,16 +217,28 @@ Expected output:
 - `PASS relay smoke`
 - `PASS session smoke`
 
-## SOCKS5 Thin Client (TCP only, pre-alpha)
+## SOCKS5 Thin Client (TCP+UDP, pre-alpha)
 
-Minimal local SOCKS5 client for Windows/Linux that tunnels TCP `CONNECT` via VLF session transport.
+Local SOCKS5 client for Windows/Linux that tunnels traffic via VLF session transport.
 
-Implemented scope:
+Implemented SOCKS5 features:
 
-- SOCKS5 `no-auth` only
-- `CONNECT` only (TCP)
-- no UDP associate
-- no reconnect orchestration (simple stable path)
+- auth methods:
+  - `no-auth` (`0x00`)
+  - `username/password` (`0x02`, RFC 1929)
+- commands:
+  - `CONNECT` (TCP)
+  - `BIND` (practical implementation for compatibility)
+  - `UDP ASSOCIATE`
+- address types:
+  - IPv4, domain, IPv6 in TCP requests and UDP headers
+- UDP ASSOCIATE:
+  - per-association UDP socket bind and returned bind address/port
+  - SOCKS5 UDP header parse/encode (`RSV|FRAG|ATYP|DST.ADDR|DST.PORT|DATA`)
+  - `FRAG=0` supported
+  - `FRAG!=0` dropped with clear logs and counters
+  - NAT table with reverse path (`VLF UDP flow <-> SOCKS UDP datagrams`)
+  - idle cleanup and limits
 
 Build:
 
@@ -237,8 +249,33 @@ go build ./cmd/socks_client
 Run:
 
 ```bash
-./socks_client --server <gateway-host> --port 443
+./socks_client --server <gateway-host> --port-udp 8443 --port-tcp 443
 ```
+
+Auth flags:
+
+- `--auth none|userpass` (default `none`)
+- `--username <u> --password <p>` for `--auth userpass`
+
+UDP flags:
+
+- `--udp-idle-timeout` (default `60s`)
+- `--udp-max-associations` (default `128`)
+- `--udp-max-nat` (default `4096`)
+
+Metrics:
+
+- `--metrics-listen 127.0.0.1:2113` (default enabled)
+- Prometheus endpoint: `http://127.0.0.1:2113/metrics`
+- key counters:
+  - `vlf_socks_connect_total`
+  - `vlf_socks_bind_total`
+  - `vlf_socks_udp_associate_total`
+  - `vlf_socks_auth_failures_total`
+  - `vlf_socks_udp_packets_in_total`
+  - `vlf_socks_udp_packets_out_total`
+  - `vlf_socks_udp_active_associations`
+  - `vlf_socks_udp_active_nat_entries`
 
 Policy mode:
 
@@ -299,6 +336,29 @@ QUIC-blocked simulation:
 
 ```bash
 ./socks_client --server <gateway-host> --port 443 --mode auto --disable-quic
+```
+
+### sing-box outbound via VLF SOCKS
+
+Example outbound (SOCKS5 + UDP capable):
+
+```json
+{
+  "type": "socks",
+  "tag": "vlf-socks",
+  "server": "127.0.0.1",
+  "server_port": 1080,
+  "version": "5",
+  "username": "vlf",
+  "password": "vlfpass"
+}
+```
+
+Run `socks_client` with matching auth:
+
+```bash
+./socks_client --listen 127.0.0.1:1080 --auth userpass --username vlf --password vlfpass \
+  --server <gateway-host> --port-udp 8443 --port-tcp 443 --mode auto
 ```
 
 ## TUN Mode (Windows, Stages 1-3)

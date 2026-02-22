@@ -14,12 +14,12 @@ func TestNegotiateSOCKS5ConnectDomain(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	resultCh := make(chan socksTarget, 1)
+	resultCh := make(chan socksRequest, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		target, err := negotiateSOCKS5(server)
+		req, err := negotiateSOCKS5(server, authConfig{mode: authModeNone}, &clientMetrics{})
 		if err == nil {
-			resultCh <- target
+			resultCh <- req
 		}
 		errCh <- err
 	}()
@@ -52,9 +52,12 @@ func TestNegotiateSOCKS5ConnectDomain(t *testing.T) {
 	}
 
 	select {
-	case target := <-resultCh:
-		if target.Host != host || target.Port != 443 {
-			t.Fatalf("unexpected target: %#v", target)
+	case req := <-resultCh:
+		if req.Cmd != socksCmdConnect {
+			t.Fatalf("unexpected cmd: %d", req.Cmd)
+		}
+		if req.Target.Host != host || req.Target.Port != 443 {
+			t.Fatalf("unexpected target: %#v", req.Target)
 		}
 	default:
 		t.Fatal("missing parsed target")
@@ -68,7 +71,7 @@ func TestNegotiateSOCKS5RejectUnsupportedCommand(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := negotiateSOCKS5(server)
+		_, err := negotiateSOCKS5(server, authConfig{mode: authModeNone}, &clientMetrics{})
 		errCh <- err
 	}()
 
@@ -81,8 +84,8 @@ func TestNegotiateSOCKS5RejectUnsupportedCommand(t *testing.T) {
 		t.Fatalf("unexpected method selected: %d", methodReply[1])
 	}
 
-	// CMD=0x03 (UDP ASSOCIATE) should be rejected right after header parse.
-	req := []byte{socksVer5, 0x03, 0x00, socksAtypIPv4}
+	// CMD=0x09 should be rejected right after header parse.
+	req := []byte{socksVer5, 0x09, 0x00, socksAtypIPv4}
 	_, _ = client.Write(req)
 
 	reply := make([]byte, 10)

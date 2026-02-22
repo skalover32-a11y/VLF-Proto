@@ -10,9 +10,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,16 +29,22 @@ const (
 	socksVer5 = 0x05
 
 	socksMethodNoAuth       = 0x00
+	socksMethodUserPass     = 0x02
 	socksMethodNoAcceptable = 0xff
 
 	socksCmdConnect = 0x01
+	socksCmdBind    = 0x02
+	socksCmdUDP     = 0x03
 
 	socksAtypIPv4   = 0x01
 	socksAtypDomain = 0x03
 	socksAtypIPv6   = 0x04
 
+	socksUserAuthVer = 0x01
+
 	socksReplySuccess            = 0x00
 	socksReplyGeneralFailure     = 0x01
+	socksReplyConnectionNotAllow = 0x02
 	socksReplyHostUnreachable    = 0x04
 	socksReplyCommandUnsupported = 0x07
 	socksReplyAddrUnsupported    = 0x08
@@ -64,8 +72,96 @@ const (
 )
 
 type socksTarget struct {
+	Atyp byte
 	Host string
 	Port int
+}
+
+type socksRequest struct {
+	Cmd    byte
+	Target socksTarget
+}
+
+type authMode string
+
+const (
+	authModeNone     authMode = "none"
+	authModeUserPass authMode = "userpass"
+)
+
+type authConfig struct {
+	mode     authMode
+	username string
+	password string
+}
+
+type clientMetrics struct {
+	authFailures      atomic.Uint64
+	connectTotal      atomic.Uint64
+	bindTotal         atomic.Uint64
+	udpAssociateTotal atomic.Uint64
+
+	udpPacketsIn      atomic.Uint64
+	udpPacketsOut     atomic.Uint64
+	udpDropsFrag      atomic.Uint64
+	udpDropsParse     atomic.Uint64
+	udpDropsAssocFull atomic.Uint64
+	udpDropsNATFull   atomic.Uint64
+	udpDropsNotClient atomic.Uint64
+
+	activeAssociations atomic.Int64
+	activeNATEntries   atomic.Int64
+}
+
+type udpAssociationManager struct {
+	controller     *policyController
+	metrics        *clientMetrics
+	connectTimeout time.Duration
+	idleTimeout    time.Duration
+	maxAssoc       int
+	maxNAT         int
+
+	mu     sync.Mutex
+	nextID uint64
+	items  map[uint64]*udpAssociation
+}
+
+type udpAssociation struct {
+	id uint64
+
+	controller     *policyController
+	metrics        *clientMetrics
+	connectTimeout time.Duration
+	idleTimeout    time.Duration
+	maxNAT         int
+
+	tcpConn net.Conn
+	udpConn *net.UDPConn
+
+	clientIP net.IP
+
+	clientMu  sync.RWMutex
+	clientUDP *net.UDPAddr
+
+	mu      sync.Mutex
+	nat     map[string]*udpNATEntry
+	closing chan struct{}
+	wg      sync.WaitGroup
+
+	closeOnce sync.Once
+	onClose   func(id uint64)
+}
+
+type udpNATEntry struct {
+	key    string
+	target socksTarget
+
+	client *sessionclient.Client
+	flow   sessionclient.UDPFlow
+	state  *flowState
+
+	lastActive atomic.Int64
+	closeOnce  sync.Once
 }
 
 type clientMode string
@@ -190,15 +286,24 @@ func main() {
 
 	listenAddr := flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address")
 	serverHost := flag.String("server", baseCfg.GatewayHost, "gateway host")
-	serverPort := flag.Int("port", baseCfg.GatewayUDP, "gateway port for QUIC and TCP session lanes")
+	serverPortLegacy := flag.Int("port", 0, "deprecated: gateway port for both QUIC and TCP session lanes")
+	serverPortUDP := flag.Int("port-udp", baseCfg.GatewayUDP, "gateway QUIC/UDP port")
+	serverPortTCP := flag.Int("port-tcp", baseCfg.GatewayTCP, "gateway TCP session port")
 	relayBase := flag.String("relay-base", baseCfg.RelayBase, "relay base URL (fallback)")
 	connectTimeout := flag.Duration("connect-timeout", 10*time.Second, "dial/open timeout per CONNECT")
+	udpIdleTimeout := flag.Duration("udp-idle-timeout", 60*time.Second, "UDP NAT idle timeout for SOCKS UDP ASSOCIATE")
+	udpMaxAssociations := flag.Int("udp-max-associations", 128, "max concurrent UDP associations")
+	udpMaxNAT := flag.Int("udp-max-nat", 4096, "max UDP NAT entries per association")
 	modeRaw := flag.String("mode", "auto", "client mode: auto|normal|fast|survival")
 	preferQUIC := flag.Bool("prefer-quic", baseCfg.PreferQUIC, "base prefer QUIC transport first")
 	disableQUIC := flag.Bool("disable-quic", baseCfg.DisableQUIC, "disable QUIC transport")
 	disableTCP := flag.Bool("disable-tcp-session", baseCfg.DisableTCPSession, "disable TCP session transport")
 	allowRelay := flag.Bool("allow-relay-fallback", baseCfg.AllowRelay, "allow HTTP relay fallback")
 	statsFormatRaw := flag.String("stats-format", "text", "stats output format: text|json")
+	authModeRaw := flag.String("auth", string(authModeNone), "SOCKS auth mode: none|userpass")
+	username := flag.String("username", "", "SOCKS username for --auth userpass")
+	password := flag.String("password", "", "SOCKS password for --auth userpass")
+	metricsListen := flag.String("metrics-listen", "127.0.0.1:2113", "metrics listen address (empty disables)")
 	clientID := flag.String("client-id", "", "override client id")
 	secret := flag.String("secret", "", "override secret (plain or b64:...)")
 	debug := flag.Bool("debug", baseCfg.Debug, "enable sessionclient debug logs")
@@ -208,21 +313,45 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid --mode: %v", err)
 	}
-	if *serverPort <= 0 || *serverPort > 65535 {
-		log.Fatalf("invalid --port=%d", *serverPort)
+	if *serverPortLegacy < 0 || *serverPortLegacy > 65535 {
+		log.Fatalf("invalid --port=%d", *serverPortLegacy)
+	}
+	if *serverPortUDP <= 0 || *serverPortUDP > 65535 {
+		log.Fatalf("invalid --port-udp=%d", *serverPortUDP)
+	}
+	if *serverPortTCP <= 0 || *serverPortTCP > 65535 {
+		log.Fatalf("invalid --port-tcp=%d", *serverPortTCP)
 	}
 	if *connectTimeout <= 0 {
 		*connectTimeout = 10 * time.Second
+	}
+	if *udpIdleTimeout <= 0 {
+		*udpIdleTimeout = 60 * time.Second
+	}
+	if *udpMaxAssociations <= 0 {
+		*udpMaxAssociations = 128
+	}
+	if *udpMaxNAT <= 0 {
+		*udpMaxNAT = 4096
 	}
 	parsedStatsFormat, err := parseStatsFormat(*statsFormatRaw)
 	if err != nil {
 		log.Fatalf("invalid --stats-format: %v", err)
 	}
+	authCfg, err := parseAuthConfig(*authModeRaw, *username, *password)
+	if err != nil {
+		log.Fatalf("invalid --auth config: %v", err)
+	}
 
 	cfg := baseCfg
 	cfg.GatewayHost = *serverHost
-	cfg.GatewayUDP = *serverPort
-	cfg.GatewayTCP = *serverPort
+	cfg.GatewayUDP = *serverPortUDP
+	cfg.GatewayTCP = *serverPortTCP
+	if *serverPortLegacy > 0 {
+		cfg.GatewayUDP = *serverPortLegacy
+		cfg.GatewayTCP = *serverPortLegacy
+		log.Printf("warning: --port is deprecated; use --port-udp/--port-tcp for split transport ports")
+	}
 	cfg.RelayBase = *relayBase
 	cfg.PreferQUIC = *preferQUIC
 	cfg.DisableQUIC = *disableQUIC
@@ -243,6 +372,9 @@ func main() {
 
 	controller := newPolicyController(cfg, mode, parsedStatsFormat)
 	defer controller.Close()
+	metrics := &clientMetrics{}
+	udpAssocMgr := newUDPAssociationManager(controller, metrics, *connectTimeout, *udpIdleTimeout, *udpMaxAssociations, *udpMaxNAT)
+	defer udpAssocMgr.CloseAll("shutdown")
 
 	ln, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
@@ -257,10 +389,15 @@ func main() {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
+	if err := startMetricsServer(ctx, *metricsListen, metrics); err != nil {
+		log.Fatalf("start metrics server: %v", err)
+	}
 
 	log.Printf("SOCKS5 listening on %s", *listenAddr)
-	log.Printf("Gateway=%s:%d mode=%s base_prefer_quic=%t base_disable_quic=%t disable_tcp=%t allow_relay=%t",
-		cfg.GatewayHost, *serverPort, mode, cfg.PreferQUIC, cfg.DisableQUIC, cfg.DisableTCPSession, cfg.AllowRelay)
+	log.Printf("SOCKS auth mode=%s udp_idle_timeout=%s udp_max_associations=%d udp_max_nat=%d",
+		authCfg.mode, *udpIdleTimeout, *udpMaxAssociations, *udpMaxNAT)
+	log.Printf("Gateway host=%s quic_udp=%d tcp_session=%d mode=%s base_prefer_quic=%t base_disable_quic=%t disable_tcp=%t allow_relay=%t",
+		cfg.GatewayHost, cfg.GatewayUDP, cfg.GatewayTCP, mode, cfg.PreferQUIC, cfg.DisableQUIC, cfg.DisableTCPSession, cfg.AllowRelay)
 
 	var wg sync.WaitGroup
 	for {
@@ -281,7 +418,7 @@ func main() {
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
-			handleConn(c, controller, *connectTimeout)
+			handleConn(c, controller, udpAssocMgr, metrics, authCfg, *connectTimeout)
 		}(conn)
 	}
 
@@ -364,6 +501,15 @@ func (c *policyController) dialConfig() (sessionclient.Config, clientMode) {
 	mode := c.currentMode
 	c.mu.Unlock()
 	return c.configForMode(mode), mode
+}
+
+func (c *policyController) dialConfigUDP() (sessionclient.Config, clientMode) {
+	cfg, mode := c.dialConfig()
+	cfg.PreferQUIC = true
+	cfg.DisableQUIC = false
+	cfg.DisableTCPSession = true
+	cfg.AllowRelay = false
+	return cfg, mode
 }
 
 func (c *policyController) configForMode(mode clientMode) sessionclient.Config {
@@ -929,22 +1075,48 @@ func maxDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
-func handleConn(conn net.Conn, controller *policyController, connectTimeout time.Duration) {
+func handleConn(
+	conn net.Conn,
+	controller *policyController,
+	udpMgr *udpAssociationManager,
+	metrics *clientMetrics,
+	authCfg authConfig,
+	connectTimeout time.Duration,
+) {
 	defer conn.Close()
 
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-	target, err := negotiateSOCKS5(conn)
+	req, err := negotiateSOCKS5(conn, authCfg, metrics)
 	if err != nil {
 		log.Printf("SOCKS handshake failed from %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
 
+	switch req.Cmd {
+	case socksCmdConnect:
+		metrics.connectTotal.Add(1)
+		handleConnect(conn, req.Target, controller, connectTimeout)
+	case socksCmdBind:
+		metrics.bindTotal.Add(1)
+		handleBind(conn, req.Target, controller, connectTimeout)
+	case socksCmdUDP:
+		metrics.udpAssociateTotal.Add(1)
+		if err := handleUDPAssociate(conn, req.Target, udpMgr); err != nil {
+			log.Printf("UDP ASSOCIATE failed from %s: %v", conn.RemoteAddr(), err)
+		}
+	default:
+		_ = writeSocksReply(conn, socksReplyCommandUnsupported)
+		log.Printf("unsupported command %d from %s", req.Cmd, conn.RemoteAddr())
+	}
+}
+
+func handleConnect(conn net.Conn, target socksTarget, controller *policyController, connectTimeout time.Duration) {
 	admissionCtx, cancelAdmission := context.WithTimeout(context.Background(), connectTimeout)
 	if err := controller.acquireFlowPermit(admissionCtx); err != nil {
 		cancelAdmission()
 		_ = writeSocksReply(conn, socksReplyGeneralFailure)
-		log.Printf("flow admission denied for %s -> %s:%d: %v", conn.RemoteAddr(), target.Host, target.Port, err)
+		log.Printf("flow admission denied for CONNECT %s -> %s:%d: %v", conn.RemoteAddr(), target.Host, target.Port, err)
 		return
 	}
 	cancelAdmission()
@@ -979,7 +1151,7 @@ func handleConn(conn net.Conn, controller *policyController, connectTimeout time
 		controller.onTransportError("open_tcp_flow_failed")
 		_ = writeSocksReply(conn, socksReplyHostUnreachable)
 		_ = client.Close()
-		log.Printf("open tcp flow failed mode=%s for %s -> %s:%d: %v", mode, conn.RemoteAddr(), target.Host, target.Port, err)
+		log.Printf("open tcp flow failed mode=%s for CONNECT %s -> %s:%d: %v", mode, conn.RemoteAddr(), target.Host, target.Port, err)
 		return
 	}
 
@@ -1001,101 +1173,193 @@ func handleConn(conn net.Conn, controller *policyController, connectTimeout time
 	proxyBidirectional(conn, flow, client, controller, fs)
 }
 
-func negotiateSOCKS5(conn net.Conn) (socksTarget, error) {
+func handleBind(conn net.Conn, target socksTarget, controller *policyController, connectTimeout time.Duration) {
+	// Practical BIND implementation over VLF TCP flow: send two success replies and proxy bytes.
+	// This supports clients that require CMD=BIND semantics while keeping transport path unified.
+	admissionCtx, cancelAdmission := context.WithTimeout(context.Background(), connectTimeout)
+	if err := controller.acquireFlowPermit(admissionCtx); err != nil {
+		cancelAdmission()
+		_ = writeSocksReply(conn, socksReplyGeneralFailure)
+		log.Printf("flow admission denied for BIND %s -> %s:%d: %v", conn.RemoteAddr(), target.Host, target.Port, err)
+		return
+	}
+	cancelAdmission()
+	permitHeld := true
+
+	cfg, mode := controller.dialConfig()
+	setupStart := time.Now()
+
+	dialCtx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	client, err := sessionclient.Dial(dialCtx, cfg)
+	cancel()
+	if err != nil {
+		if permitHeld {
+			controller.releaseFlowPermit()
+			permitHeld = false
+		}
+		controller.onDialError(cfg, err)
+		_ = writeSocksReply(conn, socksReplyGeneralFailure)
+		log.Printf("session dial failed mode=%s for BIND %s -> %s:%d: %v", mode, conn.RemoteAddr(), target.Host, target.Port, err)
+		return
+	}
+	controller.onDialSuccess(mode, cfg, client.Transport())
+
+	openCtx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	flow, err := client.OpenTCPFlow(openCtx, target.Host, target.Port)
+	cancel()
+	if err != nil {
+		if permitHeld {
+			controller.releaseFlowPermit()
+			permitHeld = false
+		}
+		controller.onTransportError("open_tcp_flow_failed")
+		_ = writeSocksReply(conn, socksReplyHostUnreachable)
+		_ = client.Close()
+		log.Printf("open tcp flow failed mode=%s for BIND %s -> %s:%d: %v", mode, conn.RemoteAddr(), target.Host, target.Port, err)
+		return
+	}
+
+	if err := writeSocksReply(conn, socksReplySuccess); err != nil {
+		if permitHeld {
+			controller.releaseFlowPermit()
+			permitHeld = false
+		}
+		controller.onTransportError("write_bind_reply1_failed")
+		_ = flow.Close()
+		_ = client.Close()
+		log.Printf("failed to send BIND first reply to %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+	if err := writeSocksReply(conn, socksReplySuccess); err != nil {
+		if permitHeld {
+			controller.releaseFlowPermit()
+			permitHeld = false
+		}
+		controller.onTransportError("write_bind_reply2_failed")
+		_ = flow.Close()
+		_ = client.Close()
+		log.Printf("failed to send BIND second reply to %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+
+	fs := controller.registerFlow(client, client.Transport(), time.Since(setupStart))
+	permitHeld = false
+	log.Printf("proxy BIND %s -> %s:%d via %s mode=%s flow_id=%d", conn.RemoteAddr(), target.Host, target.Port, client.Transport(), mode, fs.id)
+	proxyBidirectional(conn, flow, client, controller, fs)
+}
+
+func handleUDPAssociate(conn net.Conn, target socksTarget, mgr *udpAssociationManager) error {
+	assoc, bindAddr, err := mgr.Create(conn, target)
+	if err != nil {
+		_ = writeSocksReply(conn, socksReplyGeneralFailure)
+		return err
+	}
+	if err := writeSocksReplyAddr(conn, socksReplySuccess, udpAddrToSocksTarget(bindAddr)); err != nil {
+		assoc.Close("write_udp_associate_reply_failed")
+		return err
+	}
+	log.Printf("UDP ASSOCIATE created id=%d client=%s bind=%s", assoc.id, conn.RemoteAddr(), bindAddr.String())
+	assoc.Serve()
+	return nil
+}
+
+func negotiateSOCKS5(conn net.Conn, authCfg authConfig, metrics *clientMetrics) (socksRequest, error) {
 	var greetHdr [2]byte
 	if _, err := io.ReadFull(conn, greetHdr[:]); err != nil {
-		return socksTarget{}, fmt.Errorf("read greeting header: %w", err)
+		return socksRequest{}, fmt.Errorf("read greeting header: %w", err)
 	}
 	if greetHdr[0] != socksVer5 {
-		return socksTarget{}, fmt.Errorf("unsupported SOCKS version: %d", greetHdr[0])
+		return socksRequest{}, fmt.Errorf("unsupported SOCKS version: %d", greetHdr[0])
 	}
 
 	nMethods := int(greetHdr[1])
 	if nMethods <= 0 {
-		return socksTarget{}, errors.New("no auth methods provided")
+		return socksRequest{}, errors.New("no auth methods provided")
 	}
 	methods := make([]byte, nMethods)
 	if _, err := io.ReadFull(conn, methods); err != nil {
-		return socksTarget{}, fmt.Errorf("read methods: %w", err)
+		return socksRequest{}, fmt.Errorf("read methods: %w", err)
 	}
 
-	acceptNoAuth := false
-	for _, m := range methods {
-		if m == socksMethodNoAuth {
-			acceptNoAuth = true
-			break
-		}
-	}
-	if !acceptNoAuth {
+	selectedMethod := pickMethod(methods, authCfg.mode)
+	if selectedMethod == socksMethodNoAcceptable {
 		_ = writeMethodSelection(conn, socksMethodNoAcceptable)
-		return socksTarget{}, errors.New("client does not support no-auth")
+		return socksRequest{}, errors.New("client does not support configured auth method")
 	}
-	if err := writeMethodSelection(conn, socksMethodNoAuth); err != nil {
-		return socksTarget{}, fmt.Errorf("write method selection: %w", err)
+	if err := writeMethodSelection(conn, selectedMethod); err != nil {
+		return socksRequest{}, fmt.Errorf("write method selection: %w", err)
+	}
+	if selectedMethod == socksMethodUserPass {
+		if err := verifyUserPassAuth(conn, authCfg); err != nil {
+			metrics.authFailures.Add(1)
+			return socksRequest{}, err
+		}
 	}
 
 	var reqHdr [4]byte
 	if _, err := io.ReadFull(conn, reqHdr[:]); err != nil {
-		return socksTarget{}, fmt.Errorf("read request header: %w", err)
+		return socksRequest{}, fmt.Errorf("read request header: %w", err)
 	}
 	if reqHdr[0] != socksVer5 {
-		return socksTarget{}, fmt.Errorf("invalid request version: %d", reqHdr[0])
+		return socksRequest{}, fmt.Errorf("invalid request version: %d", reqHdr[0])
 	}
-	if reqHdr[1] != socksCmdConnect {
+	cmd := reqHdr[1]
+	if cmd != socksCmdConnect && cmd != socksCmdBind && cmd != socksCmdUDP {
 		_ = writeSocksReply(conn, socksReplyCommandUnsupported)
-		return socksTarget{}, fmt.Errorf("unsupported cmd: %d", reqHdr[1])
+		return socksRequest{}, fmt.Errorf("unsupported cmd: %d", cmd)
 	}
 
-	host, err := readTargetHost(conn, reqHdr[3])
+	target, err := readTarget(conn, reqHdr[3])
 	if err != nil {
 		_ = writeSocksReply(conn, socksReplyAddrUnsupported)
-		return socksTarget{}, err
+		return socksRequest{}, err
 	}
 
-	var portRaw [2]byte
-	if _, err := io.ReadFull(conn, portRaw[:]); err != nil {
-		return socksTarget{}, fmt.Errorf("read target port: %w", err)
-	}
-	port := int(binary.BigEndian.Uint16(portRaw[:]))
-	if port <= 0 {
-		_ = writeSocksReply(conn, socksReplyGeneralFailure)
-		return socksTarget{}, errors.New("invalid target port")
-	}
-
-	return socksTarget{Host: host, Port: port}, nil
+	return socksRequest{Cmd: cmd, Target: target}, nil
 }
 
-func readTargetHost(conn net.Conn, atyp byte) (string, error) {
+func readTarget(conn net.Conn, atyp byte) (socksTarget, error) {
+	target := socksTarget{Atyp: atyp}
 	switch atyp {
 	case socksAtypIPv4:
 		var ipRaw [4]byte
 		if _, err := io.ReadFull(conn, ipRaw[:]); err != nil {
-			return "", fmt.Errorf("read ipv4: %w", err)
+			return target, fmt.Errorf("read ipv4: %w", err)
 		}
-		return net.IP(ipRaw[:]).String(), nil
+		target.Host = net.IP(ipRaw[:]).String()
 	case socksAtypIPv6:
 		var ipRaw [16]byte
 		if _, err := io.ReadFull(conn, ipRaw[:]); err != nil {
-			return "", fmt.Errorf("read ipv6: %w", err)
+			return target, fmt.Errorf("read ipv6: %w", err)
 		}
-		return net.IP(ipRaw[:]).String(), nil
+		target.Host = net.IP(ipRaw[:]).String()
 	case socksAtypDomain:
 		var lnRaw [1]byte
 		if _, err := io.ReadFull(conn, lnRaw[:]); err != nil {
-			return "", fmt.Errorf("read domain length: %w", err)
+			return target, fmt.Errorf("read domain length: %w", err)
 		}
 		ln := int(lnRaw[0])
 		if ln <= 0 {
-			return "", errors.New("empty domain")
+			return target, errors.New("empty domain")
 		}
 		hostRaw := make([]byte, ln)
 		if _, err := io.ReadFull(conn, hostRaw); err != nil {
-			return "", fmt.Errorf("read domain: %w", err)
+			return target, fmt.Errorf("read domain: %w", err)
 		}
-		return string(hostRaw), nil
+		target.Host = string(hostRaw)
 	default:
-		return "", fmt.Errorf("unsupported atyp: %d", atyp)
+		return target, fmt.Errorf("unsupported atyp: %d", atyp)
 	}
+
+	var portRaw [2]byte
+	if _, err := io.ReadFull(conn, portRaw[:]); err != nil {
+		return target, fmt.Errorf("read target port: %w", err)
+	}
+	target.Port = int(binary.BigEndian.Uint16(portRaw[:]))
+	if target.Port < 0 || target.Port > 65535 {
+		return target, fmt.Errorf("invalid target port: %d", target.Port)
+	}
+	return target, nil
 }
 
 func writeMethodSelection(conn net.Conn, method byte) error {
@@ -1104,17 +1368,740 @@ func writeMethodSelection(conn net.Conn, method byte) error {
 }
 
 func writeSocksReply(conn net.Conn, reply byte) error {
-	// BND.ADDR/BND.PORT are not used by CONNECT client in this MVP.
-	out := []byte{
-		socksVer5,
-		reply,
-		0x00,
-		socksAtypIPv4,
-		0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00,
+	return writeSocksReplyAddr(conn, reply, socksTarget{
+		Atyp: socksAtypIPv4,
+		Host: "0.0.0.0",
+		Port: 0,
+	})
+}
+
+func writeSocksReplyAddr(conn net.Conn, reply byte, bind socksTarget) error {
+	out := make([]byte, 0, 4+32)
+	out = append(out, socksVer5, reply, 0x00)
+	addrRaw, err := encodeTargetAddr(bind)
+	if err != nil {
+		return err
 	}
-	_, err := conn.Write(out)
+	out = append(out, addrRaw...)
+	port := bind.Port
+	if port < 0 || port > 65535 {
+		port = 0
+	}
+	out = append(out, byte(port>>8), byte(port))
+	_, err = conn.Write(out)
 	return err
+}
+
+func parseAuthConfig(modeRaw, username, password string) (authConfig, error) {
+	mode := authMode(strings.ToLower(strings.TrimSpace(modeRaw)))
+	switch mode {
+	case authModeNone:
+		return authConfig{mode: authModeNone}, nil
+	case authModeUserPass:
+		if username == "" || password == "" {
+			return authConfig{}, errors.New("username and password are required for --auth userpass")
+		}
+		return authConfig{
+			mode:     authModeUserPass,
+			username: username,
+			password: password,
+		}, nil
+	default:
+		return authConfig{}, fmt.Errorf("unsupported mode %q", modeRaw)
+	}
+}
+
+func pickMethod(methods []byte, mode authMode) byte {
+	has := func(want byte) bool {
+		for _, m := range methods {
+			if m == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	switch mode {
+	case authModeNone:
+		if has(socksMethodNoAuth) {
+			return socksMethodNoAuth
+		}
+	case authModeUserPass:
+		if has(socksMethodUserPass) {
+			return socksMethodUserPass
+		}
+	}
+	return socksMethodNoAcceptable
+}
+
+func verifyUserPassAuth(conn net.Conn, cfg authConfig) error {
+	var ver [1]byte
+	if _, err := io.ReadFull(conn, ver[:]); err != nil {
+		return fmt.Errorf("read user/pass version: %w", err)
+	}
+	if ver[0] != socksUserAuthVer {
+		_, _ = conn.Write([]byte{socksUserAuthVer, 0x01})
+		return fmt.Errorf("invalid user/pass version: %d", ver[0])
+	}
+
+	var ulnRaw [1]byte
+	if _, err := io.ReadFull(conn, ulnRaw[:]); err != nil {
+		return fmt.Errorf("read username length: %w", err)
+	}
+	uln := int(ulnRaw[0])
+	if uln <= 0 {
+		_, _ = conn.Write([]byte{socksUserAuthVer, 0x01})
+		return errors.New("empty username")
+	}
+
+	userRaw := make([]byte, uln)
+	if _, err := io.ReadFull(conn, userRaw); err != nil {
+		return fmt.Errorf("read username: %w", err)
+	}
+
+	var plnRaw [1]byte
+	if _, err := io.ReadFull(conn, plnRaw[:]); err != nil {
+		return fmt.Errorf("read password length: %w", err)
+	}
+	pln := int(plnRaw[0])
+	if pln <= 0 {
+		_, _ = conn.Write([]byte{socksUserAuthVer, 0x01})
+		return errors.New("empty password")
+	}
+
+	passRaw := make([]byte, pln)
+	if _, err := io.ReadFull(conn, passRaw); err != nil {
+		return fmt.Errorf("read password: %w", err)
+	}
+
+	if string(userRaw) != cfg.username || string(passRaw) != cfg.password {
+		_, _ = conn.Write([]byte{socksUserAuthVer, 0x01})
+		return errors.New("invalid username/password")
+	}
+	_, err := conn.Write([]byte{socksUserAuthVer, 0x00})
+	return err
+}
+
+func encodeTargetAddr(target socksTarget) ([]byte, error) {
+	switch target.Atyp {
+	case socksAtypIPv4:
+		ip := net.ParseIP(target.Host).To4()
+		if ip == nil {
+			return nil, fmt.Errorf("invalid ipv4 addr: %q", target.Host)
+		}
+		out := make([]byte, 0, 5)
+		out = append(out, socksAtypIPv4)
+		out = append(out, ip...)
+		return out, nil
+	case socksAtypIPv6:
+		ip := net.ParseIP(target.Host)
+		if ip == nil || ip.To16() == nil {
+			return nil, fmt.Errorf("invalid ipv6 addr: %q", target.Host)
+		}
+		out := make([]byte, 0, 17)
+		out = append(out, socksAtypIPv6)
+		out = append(out, ip.To16()...)
+		return out, nil
+	case socksAtypDomain:
+		host := strings.TrimSpace(target.Host)
+		if host == "" || len(host) > 255 {
+			return nil, fmt.Errorf("invalid domain addr: %q", target.Host)
+		}
+		out := make([]byte, 0, 2+len(host))
+		out = append(out, socksAtypDomain, byte(len(host)))
+		out = append(out, host...)
+		return out, nil
+	default:
+		// Fallback: infer from host.
+		if ip := net.ParseIP(target.Host); ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				return encodeTargetAddr(socksTarget{Atyp: socksAtypIPv4, Host: ip4.String(), Port: target.Port})
+			}
+			return encodeTargetAddr(socksTarget{Atyp: socksAtypIPv6, Host: ip.String(), Port: target.Port})
+		}
+		return encodeTargetAddr(socksTarget{Atyp: socksAtypDomain, Host: target.Host, Port: target.Port})
+	}
+}
+
+func udpAddrToSocksTarget(addr *net.UDPAddr) socksTarget {
+	if addr == nil {
+		return socksTarget{Atyp: socksAtypIPv4, Host: "0.0.0.0", Port: 0}
+	}
+	if ip4 := addr.IP.To4(); ip4 != nil {
+		return socksTarget{Atyp: socksAtypIPv4, Host: ip4.String(), Port: addr.Port}
+	}
+	if ip16 := addr.IP.To16(); ip16 != nil {
+		return socksTarget{Atyp: socksAtypIPv6, Host: ip16.String(), Port: addr.Port}
+	}
+	return socksTarget{Atyp: socksAtypIPv4, Host: "0.0.0.0", Port: addr.Port}
+}
+
+func parseSocksUDPDatagram(raw []byte) (frag byte, target socksTarget, payload []byte, err error) {
+	if len(raw) < 4 {
+		return 0, target, nil, errors.New("udp datagram too short")
+	}
+	if raw[0] != 0x00 || raw[1] != 0x00 {
+		return 0, target, nil, errors.New("invalid udp rsv")
+	}
+
+	frag = raw[2]
+	atyp := raw[3]
+	target.Atyp = atyp
+	offset := 4
+
+	switch atyp {
+	case socksAtypIPv4:
+		if len(raw) < offset+4+2 {
+			return frag, target, nil, errors.New("short udp ipv4 header")
+		}
+		target.Host = net.IP(raw[offset : offset+4]).String()
+		offset += 4
+	case socksAtypIPv6:
+		if len(raw) < offset+16+2 {
+			return frag, target, nil, errors.New("short udp ipv6 header")
+		}
+		target.Host = net.IP(raw[offset : offset+16]).String()
+		offset += 16
+	case socksAtypDomain:
+		if len(raw) < offset+1 {
+			return frag, target, nil, errors.New("short udp domain length")
+		}
+		ln := int(raw[offset])
+		offset++
+		if ln <= 0 || len(raw) < offset+ln+2 {
+			return frag, target, nil, errors.New("invalid udp domain length")
+		}
+		target.Host = string(raw[offset : offset+ln])
+		offset += ln
+	default:
+		return frag, target, nil, fmt.Errorf("unsupported udp atyp: %d", atyp)
+	}
+
+	target.Port = int(binary.BigEndian.Uint16(raw[offset : offset+2]))
+	offset += 2
+	if target.Port < 0 || target.Port > 65535 {
+		return frag, target, nil, fmt.Errorf("invalid udp target port: %d", target.Port)
+	}
+	payload = raw[offset:]
+	return frag, target, payload, nil
+}
+
+func buildSocksUDPDatagram(target socksTarget, payload []byte) ([]byte, error) {
+	addrRaw, err := encodeTargetAddr(target)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, 3+len(addrRaw)+2+len(payload))
+	out = append(out, 0x00, 0x00, 0x00) // RSV + FRAG=0
+	out = append(out, addrRaw...)
+	port := target.Port
+	if port < 0 || port > 65535 {
+		port = 0
+	}
+	out = append(out, byte(port>>8), byte(port))
+	out = append(out, payload...)
+	return out, nil
+}
+
+func targetKey(target socksTarget) string {
+	host := strings.ToLower(strings.TrimSpace(target.Host))
+	return fmt.Sprintf("%d|%s|%d", target.Atyp, host, target.Port)
+}
+
+func startMetricsServer(ctx context.Context, addr string, m *clientMetrics) error {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return nil
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = io.WriteString(w, m.prometheus())
+	})
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shCtx)
+	}()
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("metrics server stopped with error: %v", err)
+		}
+	}()
+
+	log.Printf("metrics listening on %s/metrics", addr)
+	return nil
+}
+
+func (m *clientMetrics) prometheus() string {
+	var b strings.Builder
+	writeCounter := func(name string, value uint64) {
+		b.WriteString(name)
+		b.WriteByte(' ')
+		b.WriteString(strconv.FormatUint(value, 10))
+		b.WriteByte('\n')
+	}
+	writeGauge := func(name string, value int64) {
+		b.WriteString(name)
+		b.WriteByte(' ')
+		b.WriteString(strconv.FormatInt(value, 10))
+		b.WriteByte('\n')
+	}
+
+	writeCounter("vlf_socks_auth_failures_total", m.authFailures.Load())
+	writeCounter("vlf_socks_connect_total", m.connectTotal.Load())
+	writeCounter("vlf_socks_bind_total", m.bindTotal.Load())
+	writeCounter("vlf_socks_udp_associate_total", m.udpAssociateTotal.Load())
+	writeCounter("vlf_socks_udp_packets_in_total", m.udpPacketsIn.Load())
+	writeCounter("vlf_socks_udp_packets_out_total", m.udpPacketsOut.Load())
+	writeCounter("vlf_socks_udp_drops_frag_total", m.udpDropsFrag.Load())
+	writeCounter("vlf_socks_udp_drops_parse_total", m.udpDropsParse.Load())
+	writeCounter("vlf_socks_udp_drops_assoc_limit_total", m.udpDropsAssocFull.Load())
+	writeCounter("vlf_socks_udp_drops_nat_limit_total", m.udpDropsNATFull.Load())
+	writeCounter("vlf_socks_udp_drops_not_client_total", m.udpDropsNotClient.Load())
+	writeGauge("vlf_socks_udp_active_associations", m.activeAssociations.Load())
+	writeGauge("vlf_socks_udp_active_nat_entries", m.activeNATEntries.Load())
+	return b.String()
+}
+
+func newUDPAssociationManager(
+	controller *policyController,
+	metrics *clientMetrics,
+	connectTimeout time.Duration,
+	idleTimeout time.Duration,
+	maxAssoc int,
+	maxNAT int,
+) *udpAssociationManager {
+	if idleTimeout <= 0 {
+		idleTimeout = 60 * time.Second
+	}
+	if maxAssoc <= 0 {
+		maxAssoc = 128
+	}
+	if maxNAT <= 0 {
+		maxNAT = 4096
+	}
+	return &udpAssociationManager{
+		controller:     controller,
+		metrics:        metrics,
+		connectTimeout: connectTimeout,
+		idleTimeout:    idleTimeout,
+		maxAssoc:       maxAssoc,
+		maxNAT:         maxNAT,
+		items:          make(map[uint64]*udpAssociation),
+	}
+}
+
+func (m *udpAssociationManager) Create(tcpConn net.Conn, reqTarget socksTarget) (*udpAssociation, *net.UDPAddr, error) {
+	bindIP := net.IPv4(127, 0, 0, 1)
+	if laddr, ok := tcpConn.LocalAddr().(*net.TCPAddr); ok && laddr.IP != nil && !laddr.IP.IsUnspecified() {
+		if laddr.IP.To4() != nil {
+			bindIP = laddr.IP.To4()
+		} else if laddr.IP.To16() != nil {
+			bindIP = laddr.IP
+		}
+	}
+
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: bindIP, Port: 0})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	m.mu.Lock()
+	if len(m.items) >= m.maxAssoc {
+		m.mu.Unlock()
+		_ = udpConn.Close()
+		m.metrics.udpDropsAssocFull.Add(1)
+		return nil, nil, fmt.Errorf("max udp associations reached (%d)", m.maxAssoc)
+	}
+
+	m.nextID++
+	id := m.nextID
+	assoc := &udpAssociation{
+		id:             id,
+		controller:     m.controller,
+		metrics:        m.metrics,
+		connectTimeout: m.connectTimeout,
+		idleTimeout:    m.idleTimeout,
+		maxNAT:         m.maxNAT,
+		tcpConn:        tcpConn,
+		udpConn:        udpConn,
+		nat:            make(map[string]*udpNATEntry),
+		closing:        make(chan struct{}),
+		onClose: func(closeID uint64) {
+			m.mu.Lock()
+			delete(m.items, closeID)
+			m.mu.Unlock()
+			m.metrics.activeAssociations.Add(-1)
+		},
+	}
+	m.items[id] = assoc
+	m.metrics.activeAssociations.Add(1)
+	m.mu.Unlock()
+
+	if raddr, ok := tcpConn.RemoteAddr().(*net.TCPAddr); ok && raddr.IP != nil {
+		assoc.clientIP = append(net.IP(nil), raddr.IP...)
+	}
+
+	if reqTarget.Port > 0 && reqTarget.Host != "" {
+		if ip := net.ParseIP(reqTarget.Host); ip != nil {
+			assoc.clientUDP = &net.UDPAddr{IP: ip, Port: reqTarget.Port}
+		}
+	}
+
+	addr, _ := udpConn.LocalAddr().(*net.UDPAddr)
+	return assoc, addr, nil
+}
+
+func (m *udpAssociationManager) CloseAll(reason string) {
+	m.mu.Lock()
+	snapshot := make([]*udpAssociation, 0, len(m.items))
+	for _, assoc := range m.items {
+		snapshot = append(snapshot, assoc)
+	}
+	m.mu.Unlock()
+
+	for _, assoc := range snapshot {
+		assoc.Close(reason)
+	}
+}
+
+func (a *udpAssociation) Serve() {
+	a.wg.Add(3)
+	go func() {
+		defer a.wg.Done()
+		a.readClientPackets()
+	}()
+	go func() {
+		defer a.wg.Done()
+		a.janitorLoop()
+	}()
+	go func() {
+		defer a.wg.Done()
+		_, _ = io.Copy(io.Discard, a.tcpConn)
+		a.Close("tcp_control_closed")
+	}()
+
+	<-a.closing
+	a.wg.Wait()
+}
+
+func (a *udpAssociation) Close(reason string) {
+	a.closeOnce.Do(func() {
+		log.Printf("closing UDP association id=%d reason=%s", a.id, reason)
+		close(a.closing)
+		_ = a.tcpConn.Close()
+		_ = a.udpConn.Close()
+
+		a.mu.Lock()
+		entries := make([]*udpNATEntry, 0, len(a.nat))
+		for _, entry := range a.nat {
+			entries = append(entries, entry)
+		}
+		a.nat = make(map[string]*udpNATEntry)
+		a.mu.Unlock()
+
+		for _, entry := range entries {
+			a.closeEntry(entry, "association_close")
+		}
+		if a.onClose != nil {
+			a.onClose(a.id)
+		}
+	})
+}
+
+func (a *udpAssociation) readClientPackets() {
+	buf := make([]byte, 64*1024)
+	for {
+		_ = a.udpConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, srcAddr, err := a.udpConn.ReadFromUDP(buf)
+		if err != nil {
+			if isTimeoutErr(err) {
+				select {
+				case <-a.closing:
+					return
+				default:
+					continue
+				}
+			}
+			select {
+			case <-a.closing:
+				return
+			default:
+			}
+			log.Printf("udp association id=%d read failed: %v", a.id, err)
+			a.Close("udp_read_failed")
+			return
+		}
+		if n == 0 {
+			continue
+		}
+
+		a.metrics.udpPacketsIn.Add(1)
+		if !a.acceptClientSource(srcAddr) {
+			a.metrics.udpDropsNotClient.Add(1)
+			continue
+		}
+
+		frag, target, payload, err := parseSocksUDPDatagram(buf[:n])
+		if err != nil {
+			a.metrics.udpDropsParse.Add(1)
+			log.Printf("udp association id=%d parse failed: %v", a.id, err)
+			continue
+		}
+		if frag != 0 {
+			a.metrics.udpDropsFrag.Add(1)
+			log.Printf("udp association id=%d unsupported FRAG=%d target=%s:%d", a.id, frag, target.Host, target.Port)
+			continue
+		}
+		if len(payload) == 0 {
+			continue
+		}
+
+		entry, getErr := a.getOrCreateEntry(target)
+		if getErr != nil {
+			log.Printf("udp association id=%d create entry failed target=%s:%d: %v", a.id, target.Host, target.Port, getErr)
+			continue
+		}
+
+		sendCtx, cancel := context.WithTimeout(context.Background(), a.connectTimeout)
+		sendErr := entry.flow.Send(sendCtx, payload)
+		cancel()
+		if sendErr != nil {
+			a.controller.onTransportError("socks_udp_send_failed")
+			a.closeEntry(entry, "udp_send_failed")
+			continue
+		}
+
+		entry.lastActive.Store(time.Now().UnixNano())
+		entry.state.upBytes.Add(int64(len(payload)))
+		a.controller.totalUpBytes.Add(int64(len(payload)))
+	}
+}
+
+func (a *udpAssociation) janitorLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-a.closing:
+			return
+		case now := <-ticker.C:
+			cutoff := now.Add(-a.idleTimeout).UnixNano()
+			var stale []*udpNATEntry
+			a.mu.Lock()
+			for _, entry := range a.nat {
+				if entry.lastActive.Load() < cutoff {
+					stale = append(stale, entry)
+				}
+			}
+			a.mu.Unlock()
+
+			for _, entry := range stale {
+				a.closeEntry(entry, "udp_idle_timeout")
+			}
+		}
+	}
+}
+
+func (a *udpAssociation) acceptClientSource(src *net.UDPAddr) bool {
+	if src == nil || src.IP == nil {
+		return false
+	}
+	if a.clientIP != nil && !src.IP.Equal(a.clientIP) {
+		return false
+	}
+
+	a.clientMu.Lock()
+	if a.clientUDP == nil {
+		a.clientUDP = &net.UDPAddr{IP: append(net.IP(nil), src.IP...), Port: src.Port}
+	} else if a.clientUDP.IP.Equal(src.IP) {
+		a.clientUDP.Port = src.Port
+	}
+	a.clientMu.Unlock()
+	return true
+}
+
+func (a *udpAssociation) clientEndpoint() *net.UDPAddr {
+	a.clientMu.RLock()
+	defer a.clientMu.RUnlock()
+	if a.clientUDP == nil {
+		return nil
+	}
+	return &net.UDPAddr{IP: append(net.IP(nil), a.clientUDP.IP...), Port: a.clientUDP.Port}
+}
+
+func (a *udpAssociation) getOrCreateEntry(target socksTarget) (*udpNATEntry, error) {
+	key := targetKey(target)
+
+	a.mu.Lock()
+	if entry := a.nat[key]; entry != nil {
+		a.mu.Unlock()
+		return entry, nil
+	}
+	if len(a.nat) >= a.maxNAT {
+		a.mu.Unlock()
+		a.metrics.udpDropsNATFull.Add(1)
+		return nil, fmt.Errorf("max udp nat entries reached (%d)", a.maxNAT)
+	}
+	a.mu.Unlock()
+
+	admissionCtx, cancelAdmission := context.WithTimeout(context.Background(), a.connectTimeout)
+	if err := a.controller.acquireFlowPermit(admissionCtx); err != nil {
+		cancelAdmission()
+		return nil, err
+	}
+	cancelAdmission()
+	permitHeld := true
+
+	cfg, mode := a.controller.dialConfigUDP()
+	setupStart := time.Now()
+
+	dialCtx, cancel := context.WithTimeout(context.Background(), a.connectTimeout)
+	client, err := sessionclient.Dial(dialCtx, cfg)
+	cancel()
+	if err != nil {
+		if permitHeld {
+			a.controller.releaseFlowPermit()
+		}
+		a.controller.onDialError(cfg, err)
+		return nil, fmt.Errorf("dial udp session mode=%s: %w", mode, err)
+	}
+	a.controller.onDialSuccess(mode, cfg, client.Transport())
+
+	openCtx, cancel := context.WithTimeout(context.Background(), a.connectTimeout)
+	flow, err := client.OpenUDPFlow(openCtx, target.Host, target.Port)
+	cancel()
+	if err != nil {
+		if permitHeld {
+			a.controller.releaseFlowPermit()
+		}
+		a.controller.onTransportError("open_udp_flow_failed")
+		_ = client.Close()
+		return nil, err
+	}
+
+	fs := a.controller.registerFlow(client, client.Transport(), time.Since(setupStart))
+	permitHeld = false
+
+	entry := &udpNATEntry{
+		key:    key,
+		target: target,
+		client: client,
+		flow:   flow,
+		state:  fs,
+	}
+	entry.lastActive.Store(time.Now().UnixNano())
+
+	a.mu.Lock()
+	// If another goroutine created same entry while we were dialing, use it and close ours.
+	if existing := a.nat[key]; existing != nil {
+		a.mu.Unlock()
+		a.closeEntry(entry, "duplicate_entry_replace")
+		return existing, nil
+	}
+	a.nat[key] = entry
+	a.metrics.activeNATEntries.Add(1)
+	a.mu.Unlock()
+
+	log.Printf("udp association id=%d opened flow target=%s:%d via %s flow_id=%d",
+		a.id, target.Host, target.Port, client.Transport(), fs.id)
+
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		a.reverseLoop(entry)
+	}()
+
+	return entry, nil
+}
+
+func (a *udpAssociation) reverseLoop(entry *udpNATEntry) {
+	for {
+		recvCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		payload, err := entry.flow.Recv(recvCtx)
+		cancel()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				select {
+				case <-a.closing:
+					return
+				default:
+					continue
+				}
+			}
+			if isExpectedUDPErr(err) {
+				a.closeEntry(entry, "udp_recv_closed")
+				return
+			}
+			a.controller.onTransportError("socks_udp_recv_failed")
+			log.Printf("udp association id=%d reverse recv failed target=%s:%d: %v", a.id, entry.target.Host, entry.target.Port, err)
+			a.closeEntry(entry, "udp_recv_failed")
+			return
+		}
+		if len(payload) == 0 {
+			continue
+		}
+
+		clientAddr := a.clientEndpoint()
+		if clientAddr == nil {
+			continue
+		}
+
+		raw, buildErr := buildSocksUDPDatagram(entry.target, payload)
+		if buildErr != nil {
+			a.metrics.udpDropsParse.Add(1)
+			continue
+		}
+		_ = a.udpConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if _, err := a.udpConn.WriteToUDP(raw, clientAddr); err != nil {
+			if isExpectedUDPErr(err) {
+				a.closeEntry(entry, "udp_write_closed")
+				return
+			}
+			a.controller.onTransportError("socks_udp_write_client_failed")
+			log.Printf("udp association id=%d reverse write failed target=%s:%d: %v", a.id, entry.target.Host, entry.target.Port, err)
+			continue
+		}
+
+		a.metrics.udpPacketsOut.Add(1)
+		entry.lastActive.Store(time.Now().UnixNano())
+		entry.state.downBytes.Add(int64(len(payload)))
+		a.controller.totalDownBytes.Add(int64(len(payload)))
+	}
+}
+
+func (a *udpAssociation) closeEntry(entry *udpNATEntry, reason string) {
+	if entry == nil {
+		return
+	}
+	entry.closeOnce.Do(func() {
+		a.mu.Lock()
+		if cur := a.nat[entry.key]; cur == entry {
+			delete(a.nat, entry.key)
+			a.metrics.activeNATEntries.Add(-1)
+		}
+		a.mu.Unlock()
+
+		if entry.flow != nil {
+			_ = entry.flow.Close()
+		}
+		if entry.client != nil {
+			_ = entry.client.Close()
+		}
+		if entry.state != nil {
+			a.controller.unregisterFlow(entry.state.id)
+		}
+		log.Printf("udp association id=%d closed nat target=%s:%d reason=%s", a.id, entry.target.Host, entry.target.Port, reason)
+	})
 }
 
 func proxyBidirectional(local net.Conn, remote sessionclient.TCPFlow, client *sessionclient.Client, controller *policyController, fs *flowState) {
@@ -1184,4 +2171,25 @@ func isExpectedProbeErr(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "application error 0x0") || strings.Contains(msg, "stream reset")
+}
+
+func isExpectedUDPErr(err error) bool {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	if isTimeoutErr(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "closed pipe") ||
+		strings.Contains(msg, "application error 0x0")
+}
+
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
