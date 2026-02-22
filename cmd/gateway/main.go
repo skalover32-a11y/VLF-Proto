@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -57,7 +59,9 @@ func main() {
 		NextProtos:   []string{cfg.ProtocolID},
 	}
 
-	m := metrics.New()
+	m := metrics.NewWithConfig(metrics.Config{
+		UDPPPSHoldWindow: resolveUDPPPSHoldWindow(logger),
+	})
 	defer m.Close()
 
 	secretProvider, err := auth.NewStaticSecretProvider(cfg.ClientSecrets)
@@ -187,4 +191,19 @@ func newLogger(level string) (*zap.Logger, error) {
 	}
 
 	return cfg.Build()
+}
+
+func resolveUDPPPSHoldWindow(logger *zap.Logger) time.Duration {
+	const def = 3 * time.Second
+
+	raw := strings.TrimSpace(os.Getenv("VLF_UDP_PPS_HOLD_SECONDS"))
+	if raw == "" {
+		return def
+	}
+	secs, err := strconv.Atoi(raw)
+	if err != nil || secs < 0 {
+		logger.Warn("invalid VLF_UDP_PPS_HOLD_SECONDS, using default", zap.String("value", raw), zap.Duration("default", def))
+		return def
+	}
+	return time.Duration(secs) * time.Second
 }

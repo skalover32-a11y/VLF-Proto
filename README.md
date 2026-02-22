@@ -62,10 +62,10 @@ docker run --rm --network "$NET" -v "$PWD":/src -w /src golang:1.24-alpine sh -l
   'apk add --no-cache git ca-certificates && \
    RELAY_BASE=http://gateway:8080 RELAY_DIAL_HOST=tcp-echo RELAY_DIAL_PORT=9000 \
    VLF_CLIENT=smoke-client VLF_SECRET=smoke-secret \
-   go run ./scripts/relay_smoke.go'
+   go run ./scripts/relay_smoke/main.go'
 ```
 
-`relay_smoke.go` accepts `VLF_CLIENT` or `VLF_CLIENT_ID`, and `VLF_SECRET`.
+`scripts/relay_smoke/main.go` accepts `VLF_CLIENT` or `VLF_CLIENT_ID`, and `VLF_SECRET`.
 
 Session smoke (auto fallback: QUIC -> TCP session -> HTTP relay):
 
@@ -113,6 +113,40 @@ Run (Windows PowerShell):
 ```
 
 `run-bench.ps1` also imports `scripts/.env` by default.
+
+Bench matrix runners (predefined combinations):
+
+Linux/macOS:
+
+```bash
+./scripts/run-bench-matrix.sh
+./scripts/run-bench-matrix.sh --duration 20s
+```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\run-bench-matrix.ps1
+.\scripts\run-bench-matrix.ps1 -Duration 20s
+```
+
+Matrix coverage:
+
+- clients: `1`, `2`
+- udp-pps: `300`, `600`, `900`, `1200`
+- udp-payload-bytes: `256`, `1200`
+- udp-burst: `10`
+- tcp-flows: `1`, tcp-total-mb: `8`
+- quality thresholds: `udp-max-loss=0.05`, `udp-max-jitter-ms=50`, `tcp-min-mbps=1`
+
+Each matrix run writes reports to:
+
+- `reports/<timestamp>/c<clients>_pps<udp-pps>_pl<udp-payload>/`
+  - `proto_bench_report.json`
+  - `proto_bench_report.md`
+  - `console.log`
+
+The matrix runner always continues after failed runs and prints PASS/FAIL summary at the end.
 
 Direct Go run:
 
@@ -373,6 +407,18 @@ Configured in `limits` section:
 - `vlf_replay_drops_total`
 - `vlf_open_failures_total{lane,reason}`
 
+`vlf_udp_pps` behavior:
+
+- live forwarded PPS gauge (`client -> dst`) updated every second
+- holds the last non-zero value for a short idle window
+- drops to `0` after no forwarded traffic for `VLF_UDP_PPS_HOLD_SECONDS` (default `3`)
+
+For monitoring/alerting, use the counter as canonical source:
+
+```promql
+rate(vlf_udp_forwarded_total[10s])
+```
+
 ### Logs
 
 JSON structured logs via `zap`.
@@ -398,6 +444,10 @@ Key fields:
 - `limits.*`
 - `timeouts.relay_idle`, `timeouts.session_idle`, `timeouts.dial_timeout`
 - `max_dgram_payload`
+
+Optional env overrides:
+
+- `VLF_UDP_PPS_HOLD_SECONDS` (default `3`) controls how long `vlf_udp_pps` stays non-zero after traffic stops.
 
 Gateway docker setup mounts `./certs` to `/app/certs` and uses:
 
@@ -465,6 +515,30 @@ sudo sysctl -w net.core.wmem_default=262144
 
 Persist via `/etc/sysctl.d/*.conf` in production.
 
+## Bench Debugging Helpers
+
+Server-side metric snapshots around a bench run:
+
+```bash
+./scripts/metrics-diff.sh before
+# run proto_bench / matrix here
+./scripts/metrics-diff.sh after
+./scripts/metrics-diff.sh diff
+```
+
+Optional args:
+
+- `./scripts/metrics-diff.sh before http://127.0.0.1:8080 /tmp/vlf_metrics`
+
+Tracked counters:
+
+- `vlf_recv_datagrams_total`
+- `vlf_udp_forwarded_total`
+- `vlf_udp_dst_rx_total`
+- `vlf_udp_to_client_total`
+- `vlf_udp_to_client_fail_total`
+- `vlf_dropped_datagrams_total{reason=...}`
+
 ## Goroutine/resource shutdown checks
 
 Gateway supports graceful shutdown for HTTP, QUIC sessions, relay connections, and TTL wheels.
@@ -484,7 +558,7 @@ Validated commands:
 
 - `go test ./internal/auth`
 - `go build ./cmd/gateway`
-- `go build -o scripts/out/relay_smoke.exe ./scripts/relay_smoke.go`
+- `go build -o scripts/out/relay_smoke.exe ./scripts/relay_smoke/main.go`
 - `go build -o scripts/out/session_smoke.exe ./scripts/session_smoke.go`
 - metrics scrape from `/metrics`.
 

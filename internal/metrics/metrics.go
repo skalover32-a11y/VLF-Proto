@@ -2,12 +2,19 @@ package metrics
 
 import (
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+type Config struct {
+	UDPPPSHoldWindow time.Duration
+	PPSTickInterval  time.Duration
+	Now              func() time.Time
+}
 
 type Metrics struct {
 	registry *prometheus.Registry
@@ -35,10 +42,24 @@ type Metrics struct {
 	udpPacketsSecond       atomic.Uint64
 	datagramProcSecond     atomic.Uint64
 	datagramQueueLenAtomic atomic.Int64
-	stopCh                 chan struct{}
+	udpPPSHoldWindow       time.Duration
+	ppsTickInterval        time.Duration
+	nowFn                  func() time.Time
+
+	udpPPSMu      sync.Mutex
+	lastForwardAt time.Time
+	lastUDPPPS    float64
+
+	stopCh chan struct{}
 }
 
 func New() *Metrics {
+	return NewWithConfig(Config{})
+}
+
+func NewWithConfig(cfg Config) *Metrics {
+	cfg = normalizeConfig(cfg)
+
 	reg := prometheus.NewRegistry()
 
 	m := &Metrics{
@@ -119,7 +140,10 @@ func New() *Metrics {
 			Name: "vlf_open_failures_total",
 			Help: "Open failures by lane and reason",
 		}, []string{"lane", "reason"}),
-		stopCh: make(chan struct{}),
+		udpPPSHoldWindow: cfg.UDPPPSHoldWindow,
+		ppsTickInterval:  cfg.PPSTickInterval,
+		nowFn:            cfg.Now,
+		stopCh:           make(chan struct{}),
 	}
 
 	reg.MustRegister(
@@ -148,15 +172,27 @@ func New() *Metrics {
 	return m
 }
 
+func normalizeConfig(cfg Config) Config {
+	if cfg.UDPPPSHoldWindow <= 0 {
+		cfg.UDPPPSHoldWindow = 3 * time.Second
+	}
+	if cfg.PPSTickInterval <= 0 {
+		cfg.PPSTickInterval = time.Second
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	return cfg
+}
+
 func (m *Metrics) ppsLoop() {
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(m.ppsTickInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			pps := m.udpPacketsSecond.Swap(0)
-			m.UDPPPS.Set(float64(pps))
+			m.publishUDPPPS(m.nowFn())
 			proc := m.datagramProcSecond.Swap(0)
 			m.DatagramProcPPS.Set(float64(proc))
 		case <-m.stopCh:
@@ -178,6 +214,11 @@ func (m *Metrics) ObserveUDPForwarded() {
 	m.UDPPackets.Inc()
 	m.UDPForwarded.Inc()
 	m.udpPacketsSecond.Add(1)
+
+	now := m.nowFn()
+	m.udpPPSMu.Lock()
+	m.lastForwardAt = now
+	m.udpPPSMu.Unlock()
 }
 
 func (m *Metrics) ObserveUDPDstRX() {
@@ -228,6 +269,34 @@ func (m *Metrics) AddDatagramQueue(delta int64) {
 
 func (m *Metrics) DatagramQueueCurrent() int64 {
 	return m.datagramQueueLenAtomic.Load()
+}
+
+func (m *Metrics) publishUDPPPS(now time.Time) {
+	pps := m.udpPacketsSecond.Swap(0)
+
+	m.udpPPSMu.Lock()
+	defer m.udpPPSMu.Unlock()
+
+	if pps > 0 {
+		m.lastUDPPPS = float64(pps)
+		if m.lastForwardAt.IsZero() {
+			m.lastForwardAt = now
+		}
+		m.UDPPPS.Set(m.lastUDPPPS)
+		return
+	}
+
+	if m.lastForwardAt.IsZero() {
+		m.UDPPPS.Set(0)
+		return
+	}
+
+	if now.Sub(m.lastForwardAt) >= m.udpPPSHoldWindow {
+		m.UDPPPS.Set(0)
+		return
+	}
+
+	m.UDPPPS.Set(m.lastUDPPPS)
 }
 
 func (m *Metrics) Close() {

@@ -454,7 +454,7 @@ if ($SessionGo) {
   $SessionGo = Resolve-WithBase $WorkDir $SessionGo
 }
 if (-not $RelayGo) {
-  $RelayGo = Pick-Value "" $DotEnv @("RELAY_GO") "relay_smoke.go"
+  $RelayGo = Pick-Value "" $DotEnv @("RELAY_GO") "relay_smoke/main.go"
 }
 if ($RelayGo) {
   $RelayGo = Resolve-WithBase $WorkDir $RelayGo
