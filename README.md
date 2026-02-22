@@ -215,6 +215,45 @@ Expected output:
 - `PASS relay smoke`
 - `PASS session smoke`
 
+## SOCKS5 Thin Client (TCP only, pre-alpha)
+
+Minimal local SOCKS5 client for Windows/Linux that tunnels TCP `CONNECT` via VLF session transport.
+
+Implemented scope:
+
+- SOCKS5 `no-auth` only
+- `CONNECT` only (TCP)
+- no UDP associate
+- no reconnect orchestration (simple stable path)
+
+Build:
+
+```bash
+go build ./cmd/socks_client
+```
+
+Run:
+
+```bash
+./socks_client --server <gateway-host> --port 443
+```
+
+Defaults:
+
+- listen: `127.0.0.1:1080`
+- transport order uses `internal/sessionclient` (`QUIC -> TCP session -> relay`, configurable by env/flags)
+- auth defaults from env loader:
+  - `VLF_CLIENT` / `VLF_CLIENT_ID`
+  - `VLF_SECRET` (plain or `b64:...`)
+
+Quick test:
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
+```
+
+Expected: returned IP is gateway egress IP.
+
 ## Relay lane API v0.1
 
 Base path: `/v1/relay/*`
