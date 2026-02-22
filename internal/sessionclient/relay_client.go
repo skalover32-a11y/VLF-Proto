@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vlf-runtime/internal/auth"
@@ -24,6 +26,8 @@ type relayClient struct {
 	httpClient *http.Client
 	baseURL    string
 }
+
+var relayNonceSeq atomic.Uint64
 
 type relayTCPFlow struct {
 	id      uint64
@@ -206,7 +210,7 @@ func (c *relayClient) signedRequest(ctx context.Context, method, fullPath string
 	}
 
 	ts := time.Now().UnixMilli()
-	nonce := strconv.FormatInt(time.Now().UnixNano(), 10)
+	nonce := newRelayNonce()
 	bodyHash := auth.HashBody(body)
 	material := fmt.Sprintf("%s|%s|%d|%s|%s", method, signedPath, ts, nonce, bodyHash)
 	sig := signHex(c.cfg.Secret, material)
@@ -229,4 +233,15 @@ func signHex(secret []byte, payload string) string {
 	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write([]byte(payload))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func newRelayNonce() string {
+	seq := relayNonceSeq.Add(1)
+
+	var buf [12]byte
+	if _, err := rand.Read(buf[:]); err == nil {
+		return fmt.Sprintf("%x-%x", buf[:], seq)
+	}
+
+	return fmt.Sprintf("%d-%x", time.Now().UnixNano(), seq)
 }
