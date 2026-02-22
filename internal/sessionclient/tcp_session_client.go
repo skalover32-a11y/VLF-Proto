@@ -61,6 +61,7 @@ func dialTCPSession(ctx context.Context, cfg Config) (*tcpSessionClient, error) 
 	if err != nil {
 		return nil, err
 	}
+	debugf(cfg, "attempting TCP session dial: addr=%s sni=%s alpn=%v timeout=%s", cfg.TCPAddr(), tlsConf.ServerName, tlsConf.NextProtos, cfg.TCPTimeout)
 
 	dialer := &net.Dialer{Timeout: cfg.TCPTimeout}
 	conn, err := tls.DialWithDialer(dialer, "tcp", cfg.TCPAddr(), tlsConf)

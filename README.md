@@ -81,6 +81,8 @@ Common session smoke env vars:
 - `GATEWAY_PORT_UDP` (default `443`)
 - `GATEWAY_PORT_TCP` (default `443`)
 - `RELAY_BASE` (default `http://<GATEWAY_HOST>:8080`)
+- `VLF_PROTO_ID` (primary ALPN, default `vlf-runtime/0.1`)
+- `VLF_PROTO_ID_COMPAT` (optional comma-separated extra ALPN ids for client compatibility)
 - `VLF_DEBUG=1` enables detailed transport diagnostics (DNS, UDP probe, dial errors).
 - `VLF_DISABLE_RELAY_FALLBACK=1` forces failure if QUIC/TCP session transports fail (useful for negative pin/auth tests).
 
@@ -432,6 +434,9 @@ Transport:
 - QUIC UDP (`listen_quic`, default `:443`)
 - TLS/TCP (`listen_tcp`, default `:443`) for fallback transport
 - ALPN/protocol id from config (`protocol_id`, default `vlf-runtime/0.1`)
+- gateway also accepts compatibility ALPN ids:
+  - built-in: `vlf-runtime/0.1`, `vlf-session/0.1`
+  - optional env: `VLF_PROTOCOL_ID_COMPAT=proto1,proto2`
 - QUIC DATAGRAM enabled
 
 Model:

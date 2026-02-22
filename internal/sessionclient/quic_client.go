@@ -67,6 +67,7 @@ func dialQUIC(ctx context.Context, cfg Config) (*quicClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	debugf(cfg, "attempting QUIC dial: addr=%s sni=%s alpn=%v timeout=%s", cfg.QUICAddr(), tlsConf.ServerName, tlsConf.NextProtos, cfg.QUICTimeout)
 
 	conn, err := quic.DialAddr(dialCtx, cfg.QUICAddr(), tlsConf, &quic.Config{
 		EnableDatagrams: true,

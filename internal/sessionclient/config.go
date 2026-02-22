@@ -26,6 +26,7 @@ type Config struct {
 	ClientID string
 	Secret   []byte
 	ProtoID  string
+	ProtoIDs []string
 	PinSPKI  string
 
 	MaxDgramPayload int
@@ -39,6 +40,11 @@ type Config struct {
 	Debug             bool
 }
 
+var defaultProtoIDCompat = []string{
+	"vlf-runtime/0.1",
+	"vlf-session/0.1",
+}
+
 func LoadConfigFromEnv() (Config, error) {
 	clientID := envAny([]string{"VLF_CLIENT_ID", "VLF_CLIENT"}, "smoke-client")
 	secretRaw := envOr("VLF_SECRET", "smoke-secret")
@@ -48,6 +54,8 @@ func LoadConfigFromEnv() (Config, error) {
 	}
 
 	protoID := envOr("VLF_PROTO_ID", "vlf-runtime/0.1")
+	protoCompat := splitCSVEnv("VLF_PROTO_ID_COMPAT")
+	protoIDs := buildProtoIDList(protoID, protoCompat)
 	pin := envOr("VLF_PIN_SPKI", "")
 
 	defaultPort := envOrInt("GATEWAY_PORT", 443)
@@ -80,7 +88,8 @@ func LoadConfigFromEnv() (Config, error) {
 		RelayBase:   relayBase,
 		ClientID:    clientID,
 		Secret:      secret,
-		ProtoID:     protoID,
+		ProtoID:     protoIDs[0],
+		ProtoIDs:    protoIDs,
 		PinSPKI:     pin,
 
 		MaxDgramPayload:   envOrInt("MAX_DGRAM_PAYLOAD", 1200),
@@ -112,11 +121,16 @@ func (c Config) TCPAddr() string {
 }
 
 func (c Config) TLSConfig() (*tls.Config, error) {
+	alpn := c.ProtoIDs
+	if len(alpn) == 0 {
+		alpn = buildProtoIDList(c.ProtoID, nil)
+	}
+
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         c.GatewayHost,
 		MinVersion:         tls.VersionTLS13,
-		NextProtos:         []string{c.ProtoID},
+		NextProtos:         alpn,
 	}
 
 	if strings.TrimSpace(c.PinSPKI) == "" {
@@ -186,18 +200,18 @@ func splitHostPort(addr string) (string, int, error) {
 
 func envOr(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
-		return v
+		return strings.TrimSpace(v)
 	}
-	return fallback
+	return strings.TrimSpace(fallback)
 }
 
 func envAny(names []string, fallback string) string {
 	for _, name := range names {
 		if v := os.Getenv(name); v != "" {
-			return v
+			return strings.TrimSpace(v)
 		}
 	}
-	return fallback
+	return strings.TrimSpace(fallback)
 }
 
 func envOrInt(name string, fallback int) int {
@@ -233,4 +247,51 @@ func constantTimeEqual(a, b []byte) bool {
 		out |= a[i] ^ b[i]
 	}
 	return out == 0
+}
+
+func splitCSVEnv(name string) []string {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
+}
+
+func buildProtoIDList(primary string, extra []string) []string {
+	out := make([]string, 0, 1+len(extra)+len(defaultProtoIDCompat))
+	seen := make(map[string]struct{}, 1+len(extra)+len(defaultProtoIDCompat))
+
+	appendOne := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+
+	appendOne(primary)
+	for _, v := range extra {
+		appendOne(v)
+	}
+	for _, v := range defaultProtoIDCompat {
+		appendOne(v)
+	}
+
+	if len(out) == 0 {
+		out = append(out, "vlf-runtime/0.1")
+	}
+	return out
 }

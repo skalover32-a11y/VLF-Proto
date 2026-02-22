@@ -53,10 +53,13 @@ func main() {
 		logger.Fatal("load TLS cert failed", zap.Error(err))
 	}
 
+	alpn := resolveALPNList(cfg.ProtocolID, os.Getenv("VLF_PROTOCOL_ID_COMPAT"))
+	logger.Info("session ALPN configured", zap.Strings("alpn", alpn))
+
 	tlsConf := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{cfg.ProtocolID},
+		NextProtos:   alpn,
 	}
 
 	m := metrics.NewWithConfig(metrics.Config{
@@ -206,4 +209,35 @@ func resolveUDPPPSHoldWindow(logger *zap.Logger) time.Duration {
 		return def
 	}
 	return time.Duration(secs) * time.Second
+}
+
+func resolveALPNList(primary string, compatRaw string) []string {
+	const def = "vlf-runtime/0.1"
+
+	out := make([]string, 0, 4)
+	seen := make(map[string]struct{}, 4)
+
+	appendOne := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+
+	appendOne(primary)
+	for _, part := range strings.Split(strings.TrimSpace(compatRaw), ",") {
+		appendOne(part)
+	}
+	appendOne("vlf-runtime/0.1")
+	appendOne("vlf-session/0.1")
+
+	if len(out) == 0 {
+		out = append(out, def)
+	}
+	return out
 }
