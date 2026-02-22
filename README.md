@@ -370,6 +370,33 @@ Run `socks_client` with matching auth:
   --port-udp 8443 --port-tcp 443 --mode auto
 ```
 
+One-window runner (Windows, combined logs for analysis):
+
+```powershell
+.\scripts\run-vlf-stack.ps1 `
+  -GatewayHost troynichek-live.ru `
+  -GatewayIP 5.180.46.33 `
+  -SingBoxConfig .\config.json
+```
+
+What it does:
+
+1. Starts `socks_client` and waits for `127.0.0.1:1080`.
+2. Starts `sing-box` in the same PowerShell window.
+3. Streams both process logs with prefixes (`SOCKS-*`, `SING-*`) to one console.
+4. Writes run artifacts to `scripts/out/stack/<timestamp>/`:
+   - `combined.log`
+   - `socks_client.stdout.log`, `socks_client.stderr.log`
+   - `sing_box.stdout.log`, `sing_box.stderr.log`
+   - `run.json` (args, pids, start/end, exit codes)
+
+Useful flags:
+
+- `-Build` rebuilds `socks_client` before start
+- `-SessionDebug` passes `--debug` to `socks_client`
+- `-RunSeconds 120` auto-stop after 120s
+- `-NoSingBox` run only `socks_client` (still with logging)
+
 Troubleshooting for sing-box TUN (`no internet`, repeated UDP to `172.19.0.2:53`):
 
 1. Ensure `socks_client` is running before `sing-box` and listening on `127.0.0.1:1080`.
