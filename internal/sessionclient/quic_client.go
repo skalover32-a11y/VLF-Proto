@@ -186,7 +186,7 @@ func (c *quicClient) openUDPFlow(ctx context.Context, flowID uint64, dstHost str
 		id:         flowID,
 		client:     c,
 		reassembly: session.NewReassembly(),
-		incoming:   make(chan []byte, 1024),
+		incoming:   make(chan []byte, 8192),
 		errCh:      make(chan error, 1),
 	}
 

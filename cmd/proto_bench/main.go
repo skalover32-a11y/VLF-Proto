@@ -479,13 +479,17 @@ func runUDPPPS(cfg sessionclient.Config, opts benchOptions) udpPPSResult {
 		seq uint32
 		rtt float64
 	}
-	recvCh := make(chan recvItem, 1024)
 	recvErrCh := make(chan error, 1)
+	recvDone := make(chan struct{})
+	seenMu := sync.Mutex{}
+	seen := make(map[uint32]struct{}, int(float64(opts.UDPPPS)*opts.Duration.Seconds())+1024)
+	rtts := make([]float64, 0, int(float64(opts.UDPPPS)*opts.Duration.Seconds())+1024)
 
 	recvCtx, recvCancel := context.WithCancel(ctx)
 	defer recvCancel()
 
 	go func() {
+		defer close(recvDone)
 		for {
 			payload, err := udpFlow.Recv(recvCtx)
 			if err != nil {
@@ -498,7 +502,13 @@ func runUDPPPS(cfg sessionclient.Config, opts benchOptions) udpPPSResult {
 			seq := binary.BigEndian.Uint32(payload[:4])
 			sentNs := int64(binary.BigEndian.Uint64(payload[4:12]))
 			rttMS := float64(time.Since(time.Unix(0, sentNs)).Microseconds()) / 1000.0
-			recvCh <- recvItem{seq: seq, rtt: rttMS}
+			item := recvItem{seq: seq, rtt: rttMS}
+			seenMu.Lock()
+			if _, ok := seen[item.seq]; !ok {
+				seen[item.seq] = struct{}{}
+				rtts = append(rtts, item.rtt)
+			}
+			seenMu.Unlock()
 		}
 	}()
 
@@ -552,23 +562,18 @@ func runUDPPPS(cfg sessionclient.Config, opts benchOptions) udpPPSResult {
 
 	time.Sleep(2 * time.Second)
 	recvCancel()
-
-	seen := make(map[uint32]struct{}, sent)
-	rtts := make([]float64, 0, sent)
-	for {
-		select {
-		case item := <-recvCh:
-			if _, ok := seen[item.seq]; ok {
-				continue
-			}
-			seen[item.seq] = struct{}{}
-			rtts = append(rtts, item.rtt)
-		default:
-			goto done
+	<-recvDone
+	select {
+	case recvErr := <-recvErrCh:
+		if recvErr != nil && !errors.Is(recvErr, context.Canceled) && !errors.Is(recvErr, io.EOF) {
+			res.Error = recvErr.Error()
 		}
+	default:
 	}
-done:
+
+	seenMu.Lock()
 	received := int64(len(seen))
+	seenMu.Unlock()
 
 	res.Sent = sent
 	res.Received = received

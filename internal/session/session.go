@@ -394,6 +394,12 @@ func (s *Session) pumpTCPFlow(flow *tcpFlow) {
 }
 
 func (s *Session) startDatagramPipeline() {
+	s.server.metrics.EnsureDroppedDatagramReason(datagramDropQueueFull)
+	s.server.metrics.EnsureDroppedDatagramReason(datagramDropFlowMissing)
+	s.server.metrics.EnsureDroppedDatagramReason(datagramDropBudget)
+	s.server.metrics.EnsureDroppedDatagramReason(datagramDropParseFail)
+	s.server.metrics.EnsureDroppedDatagramReason(datagramDropWriteFail)
+
 	workers := s.server.cfg.DatagramWorkers
 	if workers <= 0 {
 		workers = 1
@@ -547,7 +553,7 @@ func (s *Session) processDatagramTask(task udpDatagramTask) {
 	}
 
 	s.server.metrics.BytesIn.WithLabelValues("session").Add(float64(len(payload)))
-	s.server.metrics.ObserveUDPPacket()
+	s.server.metrics.ObserveUDPForwarded()
 	s.server.metrics.ObserveProcessedDatagram()
 	s.udpProcessedSec.Add(1)
 	s.touch()
@@ -738,6 +744,10 @@ func (s *Session) udpReadLoop(flow *udpFlow) {
 		if n > 0 {
 			payload := make([]byte, n)
 			copy(payload, buf[:n])
+			s.server.metrics.ObserveUDPDstRX()
+			if s.logger.Core().Enabled(zap.DebugLevel) {
+				s.logger.Debug("udp reverse read", zap.Uint64("flow_id", flow.id), zap.Int("payload_len", len(payload)))
+			}
 
 			if err := s.server.limits.AllowSessionBytes(s.id, len(payload)); err != nil {
 				s.Close("session_bytes_limit")
@@ -753,10 +763,17 @@ func (s *Session) udpReadLoop(flow *udpFlow) {
 
 			for _, pkt := range packets {
 				if sendErr := s.conn.SendDatagram(pkt); sendErr != nil {
+					s.server.metrics.ObserveUDPToClientFail()
+					if s.logger.Core().Enabled(zap.DebugLevel) {
+						s.logger.Debug("udp reverse send failed", zap.Uint64("flow_id", flow.id), zap.Int("packet_len", len(pkt)), zap.Error(sendErr))
+					}
 					s.closeFlow(flow.id, "udp_send_datagram_failed", true)
 					return
 				}
-				s.server.metrics.ObserveUDPPacket()
+				s.server.metrics.ObserveUDPToClient()
+				if s.logger.Core().Enabled(zap.DebugLevel) {
+					s.logger.Debug("udp reverse send", zap.Uint64("flow_id", flow.id), zap.Int("packet_len", len(pkt)))
+				}
 			}
 
 			s.server.metrics.BytesOut.WithLabelValues("session").Add(float64(len(payload)))
