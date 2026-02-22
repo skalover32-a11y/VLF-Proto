@@ -73,3 +73,15 @@ func TestUDPManagerDefaultIdleTimeout(t *testing.T) {
 		t.Fatal("idle timeout must be defaulted")
 	}
 }
+
+func TestElevationTypeName(t *testing.T) {
+	if got := elevationTypeName(tokenElevationTypeFull); got != "full" {
+		t.Fatalf("unexpected type name for full: %s", got)
+	}
+	if got := elevationTypeName(tokenElevationTypeLimited); got != "limited" {
+		t.Fatalf("unexpected type name for limited: %s", got)
+	}
+	if got := elevationTypeName(999); got != "unknown" {
+		t.Fatalf("unexpected type name for unknown: %s", got)
+	}
+}

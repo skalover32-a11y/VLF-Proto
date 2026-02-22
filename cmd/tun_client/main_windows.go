@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/tun"
@@ -58,6 +59,12 @@ const (
 	capDisableConsecutive   = 3
 	capMaxNewFlowsPerSecond = 2
 	capActiveFlowsMargin    = 4
+)
+
+const (
+	tokenElevationTypeDefault = 1
+	tokenElevationTypeFull    = 2
+	tokenElevationTypeLimited = 3
 )
 
 type clientMode string
@@ -186,6 +193,12 @@ type tunReadWriter struct {
 type routeInfo struct {
 	InterfaceIndex int    `json:"InterfaceIndex"`
 	NextHop        string `json:"NextHop"`
+}
+
+type elevationState struct {
+	Elevated      bool
+	TokenElevated uint32
+	TokenType     uint32
 }
 
 type udpOptions struct {
@@ -447,12 +460,70 @@ func main() {
 }
 
 func ensureElevated() error {
-	token := windows.Token(0)
-	elevated := token.IsElevated()
-	if !elevated {
-		return errors.New("run process as Administrator")
+	state, err := queryElevationState()
+	if err != nil {
+		return fmt.Errorf("query token elevation: %w", err)
+	}
+
+	log.Printf("elevation check: elevated=%t token_elevation=%d token_elevation_type=%s(%d)",
+		state.Elevated, state.TokenElevated, elevationTypeName(state.TokenType), state.TokenType)
+
+	if !state.Elevated {
+		return errors.New("run process as Administrator (elevated PowerShell)")
 	}
 	return nil
+}
+
+func queryElevationState() (elevationState, error) {
+	var token windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token); err != nil {
+		return elevationState{}, err
+	}
+	defer token.Close()
+
+	var tokenElevated uint32
+	var outLen uint32
+	if err := windows.GetTokenInformation(
+		token,
+		windows.TokenElevation,
+		(*byte)(unsafe.Pointer(&tokenElevated)),
+		uint32(unsafe.Sizeof(tokenElevated)),
+		&outLen,
+	); err != nil {
+		return elevationState{}, err
+	}
+
+	var tokenType uint32
+	outLen = 0
+	if err := windows.GetTokenInformation(
+		token,
+		windows.TokenElevationType,
+		(*byte)(unsafe.Pointer(&tokenType)),
+		uint32(unsafe.Sizeof(tokenType)),
+		&outLen,
+	); err != nil {
+		tokenType = 0
+	}
+
+	elevated := tokenElevated != 0 || tokenType == tokenElevationTypeFull
+	return elevationState{
+		Elevated:      elevated,
+		TokenElevated: tokenElevated,
+		TokenType:     tokenType,
+	}, nil
+}
+
+func elevationTypeName(v uint32) string {
+	switch v {
+	case tokenElevationTypeDefault:
+		return "default"
+	case tokenElevationTypeFull:
+		return "full"
+	case tokenElevationTypeLimited:
+		return "limited"
+	default:
+		return "unknown"
+	}
 }
 
 func resolveGatewayIPv4(host string) (string, error) {
