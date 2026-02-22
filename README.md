@@ -238,6 +238,29 @@ Run:
 ./socks_client --server <gateway-host> --port 443
 ```
 
+Policy mode:
+
+- `--mode auto|normal|fast|survival` (default `auto`)
+- `auto` starts in `normal` and can switch:
+  - to `fast` when a flow exceeds one of:
+    - duration > `10s`
+    - download > `64MB`
+    - avg downrate > `20Mbps` over `5s`
+  - to `survival` when:
+    - QUIC failures >= `3` in `30s`
+    - transport errors spike (windowed error threshold)
+- `survival` prefers TCP session/relay path over QUIC.
+
+Live decisions and stats:
+
+- mode/transport switches are logged with reasons
+- periodic stats every `10s`:
+  - mode, last transport, active flows
+  - total bytes up/down
+  - windowed Mbps up/down/total
+  - RTT p95 (setup-latency proxy, if available)
+  - switches count
+
 Defaults:
 
 - listen: `127.0.0.1:1080`
@@ -253,6 +276,12 @@ curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
 ```
 
 Expected: returned IP is gateway egress IP.
+
+QUIC-blocked simulation:
+
+```bash
+./socks_client --server <gateway-host> --port 443 --mode auto --disable-quic
+```
 
 ## Relay lane API v0.1
 
