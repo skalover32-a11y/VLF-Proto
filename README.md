@@ -331,9 +331,15 @@ go build ./cmd/tun_client
 Run (Administrator PowerShell):
 
 ```powershell
-.\tun_client.exe --server <gateway-host> --port 443 --mtu 1350 `
+.\tun_client.exe --server <gateway-host> --port-udp 8443 --port-tcp 443 --mtu 1350 `
   --dns-resolver 1.1.1.1:53 --udp-idle-timeout 60s
 ```
+
+Port flags:
+
+- `--port-udp` for QUIC/UDP session lane.
+- `--port-tcp` for TCP session lane fallback.
+- legacy `--port` still works, but sets both ports to one value.
 
 What it configures:
 

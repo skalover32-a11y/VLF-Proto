@@ -291,7 +291,9 @@ func main() {
 	mtu := flag.Int("mtu", 1350, "TUN MTU")
 
 	serverHost := flag.String("server", baseCfg.GatewayHost, "gateway host")
-	serverPort := flag.Int("port", baseCfg.GatewayUDP, "gateway port for QUIC and TCP session lanes")
+	serverPortLegacy := flag.Int("port", 0, "deprecated: gateway port for both QUIC and TCP session lanes")
+	serverPortUDP := flag.Int("port-udp", baseCfg.GatewayUDP, "gateway QUIC/UDP port")
+	serverPortTCP := flag.Int("port-tcp", baseCfg.GatewayTCP, "gateway TCP session port")
 	relayBase := flag.String("relay-base", baseCfg.RelayBase, "relay base URL (fallback)")
 	connectTimeout := flag.Duration("connect-timeout", 10*time.Second, "dial/open timeout per TCP flow")
 	udpIdleTimeout := flag.Duration("udp-idle-timeout", 60*time.Second, "UDP NAT idle timeout")
@@ -316,8 +318,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid --stats-format: %v", err)
 	}
-	if *serverPort <= 0 || *serverPort > 65535 {
-		log.Fatalf("invalid --port=%d", *serverPort)
+	if *serverPortLegacy < 0 || *serverPortLegacy > 65535 {
+		log.Fatalf("invalid --port=%d", *serverPortLegacy)
+	}
+	if *serverPortUDP <= 0 || *serverPortUDP > 65535 {
+		log.Fatalf("invalid --port-udp=%d", *serverPortUDP)
+	}
+	if *serverPortTCP <= 0 || *serverPortTCP > 65535 {
+		log.Fatalf("invalid --port-tcp=%d", *serverPortTCP)
 	}
 	if *connectTimeout <= 0 {
 		*connectTimeout = 10 * time.Second
@@ -347,8 +355,13 @@ func main() {
 
 	cfg := baseCfg
 	cfg.GatewayHost = *serverHost
-	cfg.GatewayUDP = *serverPort
-	cfg.GatewayTCP = *serverPort
+	cfg.GatewayUDP = *serverPortUDP
+	cfg.GatewayTCP = *serverPortTCP
+	if *serverPortLegacy > 0 {
+		cfg.GatewayUDP = *serverPortLegacy
+		cfg.GatewayTCP = *serverPortLegacy
+		log.Printf("warning: --port is deprecated; use --port-udp/--port-tcp for split transport ports")
+	}
 	cfg.RelayBase = *relayBase
 	cfg.PreferQUIC = *preferQUIC
 	cfg.DisableQUIC = *disableQUIC
@@ -366,6 +379,9 @@ func main() {
 		}
 		cfg.Secret = parsedSecret
 	}
+	if cfg.DisableTCPSession && !cfg.AllowRelay {
+		log.Printf("warning: running in QUIC-only mode (tcp session and relay fallback are disabled)")
+	}
 
 	gatewayIP, err := resolveGatewayIPv4(cfg.GatewayHost)
 	if err != nil {
@@ -380,6 +396,7 @@ func main() {
 	}
 
 	log.Printf("gateway resolved: host=%s ip=%s route_if=%d route_nexthop=%s", cfg.GatewayHost, gatewayIP, route.InterfaceIndex, route.NextHop)
+	log.Printf("gateway transport ports: quic_udp=%d tcp_session=%d", cfg.GatewayUDP, cfg.GatewayTCP)
 
 	controller := newPolicyController(cfg, mode, sf)
 	defer controller.Close()
