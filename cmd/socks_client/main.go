@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -52,6 +53,14 @@ const (
 
 	statsPrintInterval = 10 * time.Second
 	policyTickInterval = time.Second
+
+	rttProbeTimeout         = 1500 * time.Millisecond
+	capRTTHighMs            = 250.0
+	capRTTLowMs             = 150.0
+	capEnableConsecutive    = 2
+	capDisableConsecutive   = 3
+	capMaxNewFlowsPerSecond = 2
+	capActiveFlowsMargin    = 4
 )
 
 type socksTarget struct {
@@ -68,10 +77,18 @@ const (
 	modeSurvival clientMode = "survival"
 )
 
+type statsFormat string
+
+const (
+	statsFormatText statsFormat = "text"
+	statsFormatJSON statsFormat = "json"
+)
+
 type flowState struct {
 	id        uint64
 	startedAt time.Time
 	transport sessionclient.Transport
+	client    *sessionclient.Client
 
 	upBytes   atomic.Int64
 	downBytes atomic.Int64
@@ -83,6 +100,32 @@ type flowState struct {
 type downSample struct {
 	at    time.Time
 	total int64
+}
+
+type rttSample struct {
+	at time.Time
+	ms float64
+}
+
+type capState struct {
+	Enabled           bool `json:"enabled"`
+	MaxNewFlowsPerSec int  `json:"max_new_flows_per_sec"`
+	MaxActiveFlows    int  `json:"max_active_flows"`
+}
+
+type statsPayload struct {
+	Mode        string    `json:"mode"`
+	Transport   string    `json:"transport"`
+	ActiveFlows int       `json:"active_flows"`
+	MbpsUp      float64   `json:"mbps_up"`
+	MbpsDown    float64   `json:"mbps_down"`
+	MbpsTotal   float64   `json:"mbps_total"`
+	BytesUp     int64     `json:"bytes_up"`
+	BytesDown   int64     `json:"bytes_down"`
+	RTTP50      *float64  `json:"rtt_p50"`
+	RTTP95      *float64  `json:"rtt_p95"`
+	Switches    uint64    `json:"switches"`
+	Caps        *capState `json:"caps,omitempty"`
 }
 
 type flowWriter struct {
@@ -104,6 +147,7 @@ type policyController struct {
 	baseCfg     sessionclient.Config
 	configured  clientMode
 	currentMode clientMode
+	statsFormat statsFormat
 
 	mu            sync.Mutex
 	nextFlowID    uint64
@@ -116,11 +160,20 @@ type policyController struct {
 	survivalSince  time.Time
 	survivalUntil  time.Time
 
-	rttSamples []float64
+	rttSamples []rttSample
 
 	lastStatsAt   time.Time
 	lastStatsUp   int64
 	lastStatsDown int64
+
+	capEnabled        bool
+	capMaxNewPerSec   int
+	capMaxActiveFlows int
+	capOpenedThisSec  int
+	capWindowSec      int64
+	pendingPermits    int
+	highRTTTicks      int
+	lowRTTTicks       int
 
 	totalUpBytes   atomic.Int64
 	totalDownBytes atomic.Int64
@@ -145,6 +198,7 @@ func main() {
 	disableQUIC := flag.Bool("disable-quic", baseCfg.DisableQUIC, "disable QUIC transport")
 	disableTCP := flag.Bool("disable-tcp-session", baseCfg.DisableTCPSession, "disable TCP session transport")
 	allowRelay := flag.Bool("allow-relay-fallback", baseCfg.AllowRelay, "allow HTTP relay fallback")
+	statsFormatRaw := flag.String("stats-format", "text", "stats output format: text|json")
 	clientID := flag.String("client-id", "", "override client id")
 	secret := flag.String("secret", "", "override secret (plain or b64:...)")
 	debug := flag.Bool("debug", baseCfg.Debug, "enable sessionclient debug logs")
@@ -159,6 +213,10 @@ func main() {
 	}
 	if *connectTimeout <= 0 {
 		*connectTimeout = 10 * time.Second
+	}
+	parsedStatsFormat, err := parseStatsFormat(*statsFormatRaw)
+	if err != nil {
+		log.Fatalf("invalid --stats-format: %v", err)
 	}
 
 	cfg := baseCfg
@@ -183,7 +241,7 @@ func main() {
 		cfg.Secret = parsedSecret
 	}
 
-	controller := newPolicyController(cfg, mode)
+	controller := newPolicyController(cfg, mode, parsedStatsFormat)
 	defer controller.Close()
 
 	ln, err := net.Listen("tcp", *listenAddr)
@@ -246,7 +304,18 @@ func parseMode(raw string) (clientMode, error) {
 	}
 }
 
-func newPolicyController(baseCfg sessionclient.Config, configured clientMode) *policyController {
+func parseStatsFormat(raw string) (statsFormat, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case string(statsFormatText):
+		return statsFormatText, nil
+	case string(statsFormatJSON):
+		return statsFormatJSON, nil
+	default:
+		return "", fmt.Errorf("%q (allowed: text|json)", raw)
+	}
+}
+
+func newPolicyController(baseCfg sessionclient.Config, configured clientMode, sf statsFormat) *policyController {
 	initial := configured
 	if configured == modeAuto {
 		initial = modeNormal
@@ -256,6 +325,7 @@ func newPolicyController(baseCfg sessionclient.Config, configured clientMode) *p
 		baseCfg:       baseCfg,
 		configured:    configured,
 		currentMode:   initial,
+		statsFormat:   sf,
 		flows:         make(map[uint64]*flowState),
 		stopCh:        make(chan struct{}),
 		doneCh:        make(chan struct{}),
@@ -282,6 +352,7 @@ func (c *policyController) loop() {
 		case <-c.stopCh:
 			return
 		case now := <-ticker.C:
+			c.probeRTT(now)
 			c.evaluateAutoPolicy(now)
 			c.printStats(now)
 		}
@@ -334,25 +405,23 @@ func (c *policyController) onTransportError(reason string) {
 	c.recordTransportError(reason)
 }
 
-func (c *policyController) registerFlow(transport sessionclient.Transport, setupDuration time.Duration) *flowState {
+func (c *policyController) registerFlow(client *sessionclient.Client, transport sessionclient.Transport, setupDuration time.Duration) *flowState {
 	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.pendingPermits > 0 {
+		c.pendingPermits--
+	}
 
 	c.nextFlowID++
 	fs := &flowState{
 		id:        c.nextFlowID,
 		startedAt: now,
 		transport: transport,
+		client:    client,
 	}
 	c.flows[fs.id] = fs
-
-	if setupDuration > 0 {
-		c.rttSamples = append(c.rttSamples, float64(setupDuration.Microseconds())/1000.0)
-		if len(c.rttSamples) > 1024 {
-			c.rttSamples = c.rttSamples[len(c.rttSamples)-1024:]
-		}
-	}
 
 	if c.lastTransport == "" {
 		c.lastTransport = transport
@@ -370,6 +439,48 @@ func (c *policyController) registerFlow(transport sessionclient.Transport, setup
 func (c *policyController) unregisterFlow(id uint64) {
 	c.mu.Lock()
 	delete(c.flows, id)
+	c.mu.Unlock()
+}
+
+func (c *policyController) acquireFlowPermit(ctx context.Context) error {
+	for {
+		now := time.Now()
+
+		c.mu.Lock()
+		if c.configured != modeAuto || !c.capEnabled {
+			c.pendingPermits++
+			c.mu.Unlock()
+			return nil
+		}
+
+		if now.Unix() != c.capWindowSec {
+			c.capWindowSec = now.Unix()
+			c.capOpenedThisSec = 0
+		}
+
+		activeNow := len(c.flows) + c.pendingPermits
+		canOpen := activeNow < c.capMaxActiveFlows && c.capOpenedThisSec < c.capMaxNewPerSec
+		if canOpen {
+			c.pendingPermits++
+			c.capOpenedThisSec++
+			c.mu.Unlock()
+			return nil
+		}
+		c.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func (c *policyController) releaseFlowPermit() {
+	c.mu.Lock()
+	if c.pendingPermits > 0 {
+		c.pendingPermits--
+	}
 	c.mu.Unlock()
 }
 
@@ -403,6 +514,59 @@ func (c *policyController) recordTransportError(reason string) {
 	if configured == modeAuto && current != modeSurvival && count >= transportErrorThreshold {
 		c.switchMode(modeSurvival, fmt.Sprintf("transport_errors_%d_in_%s", count, failureWindowDuration))
 	}
+}
+
+func (c *policyController) probeRTT(now time.Time) {
+	client, transport, ok := c.pickProbeClient()
+	if !ok {
+		return
+	}
+
+	probeCtx, cancel := context.WithTimeout(context.Background(), rttProbeTimeout)
+	defer cancel()
+
+	rtt, err := client.ProbeRTT(probeCtx)
+	if err != nil {
+		if errors.Is(err, sessionclient.ErrRTTProbeUnsupported) || isExpectedProbeErr(err) {
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			c.recordTransportError("rtt_probe_timeout_" + string(transport))
+			return
+		}
+		c.recordTransportError("rtt_probe_error_" + string(transport))
+		return
+	}
+
+	c.mu.Lock()
+	c.appendRTTSampleLocked(now, float64(rtt.Microseconds())/1000.0)
+	c.mu.Unlock()
+}
+
+func (c *policyController) pickProbeClient() (*sessionclient.Client, sessionclient.Transport, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(c.flows) == 0 {
+		return nil, "", false
+	}
+
+	var fallback *flowState
+	for _, flow := range c.flows {
+		if flow.client == nil {
+			continue
+		}
+		if fallback == nil {
+			fallback = flow
+		}
+		if c.lastTransport != "" && flow.transport == c.lastTransport {
+			return flow.client, flow.transport, true
+		}
+	}
+	if fallback == nil {
+		return nil, "", false
+	}
+	return fallback.client, fallback.transport, true
 }
 
 func (c *policyController) switchMode(next clientMode, reason string) {
@@ -486,26 +650,43 @@ func (c *policyController) evaluateAutoPolicy(now time.Time) {
 }
 
 func (c *policyController) printStats(now time.Time) {
+	upTotal := c.totalUpBytes.Load()
+	downTotal := c.totalDownBytes.Load()
+
 	c.mu.Lock()
 	if now.Sub(c.lastStatsAt) < statsPrintInterval {
 		c.mu.Unlock()
 		return
 	}
 
+	prevAt := c.lastStatsAt
+	prevUp := c.lastStatsUp
+	prevDown := c.lastStatsDown
+
 	mode := c.currentMode
 	configured := c.configured
 	lastTransport := c.lastTransport
 	activeFlows := len(c.flows)
 	switches := c.switches
-	rttP95 := percentile(c.rttSamples, 95)
-	hasRTT := len(c.rttSamples) > 0
-	prevAt := c.lastStatsAt
-	prevUp := c.lastStatsUp
-	prevDown := c.lastStatsDown
-	c.mu.Unlock()
+	sf := c.statsFormat
 
-	upTotal := c.totalUpBytes.Load()
-	downTotal := c.totalDownBytes.Load()
+	rttWindow := c.collectRTTWindowLocked(prevAt, now)
+	var rttP50Ptr *float64
+	var rttP95Ptr *float64
+	if len(rttWindow) > 0 {
+		p50 := percentile(rttWindow, 50)
+		p95 := percentile(rttWindow, 95)
+		rttP50Ptr = &p50
+		rttP95Ptr = &p95
+	}
+
+	c.updateAdaptiveCapLocked(now, activeFlows, rttP95Ptr)
+	capSnapshot := c.capSnapshotLocked()
+
+	c.lastStatsAt = now
+	c.lastStatsUp = upTotal
+	c.lastStatsDown = downTotal
+	c.mu.Unlock()
 
 	windowSec := now.Sub(prevAt).Seconds()
 	if windowSec <= 0 {
@@ -517,12 +698,6 @@ func (c *policyController) printStats(now time.Time) {
 	downMbps := bytesToMbps(deltaDown, windowSec)
 	totalMbps := upMbps + downMbps
 
-	c.mu.Lock()
-	c.lastStatsAt = now
-	c.lastStatsUp = upTotal
-	c.lastStatsDown = downTotal
-	c.mu.Unlock()
-
 	modeLabel := string(mode)
 	if configured == modeAuto {
 		modeLabel = fmt.Sprintf("auto(%s)", mode)
@@ -531,13 +706,141 @@ func (c *policyController) printStats(now time.Time) {
 	if lastTransport != "" {
 		transportLabel = string(lastTransport)
 	}
-	rttLabel := "n/a"
-	if hasRTT {
-		rttLabel = fmt.Sprintf("%.1f", rttP95)
+
+	if sf == statsFormatJSON {
+		payload := statsPayload{
+			Mode:        modeLabel,
+			Transport:   transportLabel,
+			ActiveFlows: activeFlows,
+			MbpsUp:      upMbps,
+			MbpsDown:    downMbps,
+			MbpsTotal:   totalMbps,
+			BytesUp:     upTotal,
+			BytesDown:   downTotal,
+			RTTP50:      rttP50Ptr,
+			RTTP95:      rttP95Ptr,
+			Switches:    switches,
+			Caps:        capSnapshot,
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			log.Printf("stats marshal failed: %v", err)
+		} else {
+			fmt.Println(string(raw))
+		}
+		return
 	}
 
-	log.Printf("stats mode=%s transport=%s active_flows=%d bytes_up=%d bytes_down=%d mbps_up=%.2f mbps_down=%.2f mbps_total=%.2f rtt_p95_ms=%s switches=%d",
-		modeLabel, transportLabel, activeFlows, upTotal, downTotal, upMbps, downMbps, totalMbps, rttLabel, switches)
+	rttP50Label := "n/a"
+	rttP95Label := "n/a"
+	if rttP50Ptr != nil {
+		rttP50Label = fmt.Sprintf("%.1f", *rttP50Ptr)
+	}
+	if rttP95Ptr != nil {
+		rttP95Label = fmt.Sprintf("%.1f", *rttP95Ptr)
+	}
+
+	capLabel := "off"
+	if capSnapshot != nil && capSnapshot.Enabled {
+		capLabel = fmt.Sprintf("on(new/s=%d,active<=%d)", capSnapshot.MaxNewFlowsPerSec, capSnapshot.MaxActiveFlows)
+	}
+
+	log.Printf("stats mode=%s transport=%s active_flows=%d bytes_up=%d bytes_down=%d mbps_up=%.2f mbps_down=%.2f mbps_total=%.2f rtt_p50_ms=%s rtt_p95_ms=%s switches=%d caps=%s",
+		modeLabel, transportLabel, activeFlows, upTotal, downTotal, upMbps, downMbps, totalMbps, rttP50Label, rttP95Label, switches, capLabel)
+}
+
+func (c *policyController) appendRTTSampleLocked(at time.Time, ms float64) {
+	if ms <= 0 {
+		return
+	}
+	c.rttSamples = append(c.rttSamples, rttSample{at: at, ms: ms})
+	c.pruneRTTSamplesLocked(at.Add(-2 * time.Minute))
+}
+
+func (c *policyController) pruneRTTSamplesLocked(cutoff time.Time) {
+	if len(c.rttSamples) == 0 {
+		return
+	}
+	idx := 0
+	for idx < len(c.rttSamples) && c.rttSamples[idx].at.Before(cutoff) {
+		idx++
+	}
+	if idx == 0 {
+		return
+	}
+	copy(c.rttSamples, c.rttSamples[idx:])
+	c.rttSamples = c.rttSamples[:len(c.rttSamples)-idx]
+}
+
+func (c *policyController) collectRTTWindowLocked(from, now time.Time) []float64 {
+	c.pruneRTTSamplesLocked(now.Add(-2 * time.Minute))
+	out := make([]float64, 0, len(c.rttSamples))
+	for _, sample := range c.rttSamples {
+		if sample.at.Before(from) {
+			continue
+		}
+		out = append(out, sample.ms)
+	}
+	return out
+}
+
+func (c *policyController) updateAdaptiveCapLocked(now time.Time, activeFlows int, rttP95 *float64) {
+	if c.configured != modeAuto {
+		c.capEnabled = false
+		c.capMaxNewPerSec = 0
+		c.capMaxActiveFlows = 0
+		c.highRTTTicks = 0
+		c.lowRTTTicks = 0
+		c.capOpenedThisSec = 0
+		return
+	}
+
+	if rttP95 == nil {
+		c.highRTTTicks = 0
+		c.lowRTTTicks = 0
+		return
+	}
+
+	value := *rttP95
+	switch {
+	case value > capRTTHighMs:
+		c.highRTTTicks++
+		c.lowRTTTicks = 0
+		if !c.capEnabled && c.highRTTTicks >= capEnableConsecutive {
+			current := activeFlows + c.pendingPermits
+			c.capEnabled = true
+			c.capMaxNewPerSec = capMaxNewFlowsPerSecond
+			c.capMaxActiveFlows = current + capActiveFlowsMargin
+			c.capWindowSec = now.Unix()
+			c.capOpenedThisSec = 0
+			log.Printf("policy cap enabled: reason=rtt_p95_high rtt_p95_ms=%.1f max_new_flows_per_sec=%d max_active_flows=%d",
+				value, c.capMaxNewPerSec, c.capMaxActiveFlows)
+		}
+	case value < capRTTLowMs:
+		c.lowRTTTicks++
+		c.highRTTTicks = 0
+		if c.capEnabled && c.lowRTTTicks >= capDisableConsecutive {
+			c.capEnabled = false
+			c.capMaxNewPerSec = 0
+			c.capMaxActiveFlows = 0
+			c.capOpenedThisSec = 0
+			log.Printf("policy cap disabled: reason=rtt_p95_recovered rtt_p95_ms=%.1f", value)
+		}
+	default:
+		c.highRTTTicks = 0
+		c.lowRTTTicks = 0
+	}
+}
+
+func (c *policyController) capSnapshotLocked() *capState {
+	if !c.capEnabled || c.capMaxNewPerSec <= 0 || c.capMaxActiveFlows <= 0 {
+		return nil
+	}
+	return &capState{
+		Enabled:           true,
+		MaxNewFlowsPerSec: c.capMaxNewPerSec,
+		MaxActiveFlows:    c.capMaxActiveFlows,
+	}
 }
 
 func pruneTimes(items []time.Time, cutoff time.Time) []time.Time {
@@ -637,6 +940,16 @@ func handleConn(conn net.Conn, controller *policyController, connectTimeout time
 	}
 	_ = conn.SetDeadline(time.Time{})
 
+	admissionCtx, cancelAdmission := context.WithTimeout(context.Background(), connectTimeout)
+	if err := controller.acquireFlowPermit(admissionCtx); err != nil {
+		cancelAdmission()
+		_ = writeSocksReply(conn, socksReplyGeneralFailure)
+		log.Printf("flow admission denied for %s -> %s:%d: %v", conn.RemoteAddr(), target.Host, target.Port, err)
+		return
+	}
+	cancelAdmission()
+	permitHeld := true
+
 	cfg, mode := controller.dialConfig()
 	setupStart := time.Now()
 
@@ -644,6 +957,10 @@ func handleConn(conn net.Conn, controller *policyController, connectTimeout time
 	client, err := sessionclient.Dial(dialCtx, cfg)
 	cancel()
 	if err != nil {
+		if permitHeld {
+			controller.releaseFlowPermit()
+			permitHeld = false
+		}
 		controller.onDialError(cfg, err)
 		_ = writeSocksReply(conn, socksReplyGeneralFailure)
 		log.Printf("session dial failed mode=%s for %s -> %s:%d: %v", mode, conn.RemoteAddr(), target.Host, target.Port, err)
@@ -655,6 +972,10 @@ func handleConn(conn net.Conn, controller *policyController, connectTimeout time
 	flow, err := client.OpenTCPFlow(openCtx, target.Host, target.Port)
 	cancel()
 	if err != nil {
+		if permitHeld {
+			controller.releaseFlowPermit()
+			permitHeld = false
+		}
 		controller.onTransportError("open_tcp_flow_failed")
 		_ = writeSocksReply(conn, socksReplyHostUnreachable)
 		_ = client.Close()
@@ -663,6 +984,10 @@ func handleConn(conn net.Conn, controller *policyController, connectTimeout time
 	}
 
 	if err := writeSocksReply(conn, socksReplySuccess); err != nil {
+		if permitHeld {
+			controller.releaseFlowPermit()
+			permitHeld = false
+		}
 		controller.onTransportError("write_socks_reply_failed")
 		_ = flow.Close()
 		_ = client.Close()
@@ -670,7 +995,8 @@ func handleConn(conn net.Conn, controller *policyController, connectTimeout time
 		return
 	}
 
-	fs := controller.registerFlow(client.Transport(), time.Since(setupStart))
+	fs := controller.registerFlow(client, client.Transport(), time.Since(setupStart))
+	permitHeld = false
 	log.Printf("proxy CONNECT %s -> %s:%d via %s mode=%s flow_id=%d", conn.RemoteAddr(), target.Host, target.Port, client.Transport(), mode, fs.id)
 	proxyBidirectional(conn, flow, client, controller, fs)
 }
@@ -847,4 +1173,15 @@ func isExpectedPipeErr(err error) bool {
 	}
 	msg := err.Error()
 	return msg == "use of closed network connection" || msg == "EOF"
+}
+
+func isExpectedProbeErr(err error) bool {
+	if isExpectedPipeErr(err) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "application error 0x0") || strings.Contains(msg, "stream reset")
 }

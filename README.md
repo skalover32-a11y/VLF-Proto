@@ -249,17 +249,33 @@ Policy mode:
   - to `survival` when:
     - QUIC failures >= `3` in `30s`
     - transport errors spike (windowed error threshold)
+- in `auto` mode adaptive admission cap is applied when congestion is detected:
+  - if RTT p95 > `250ms` for `2` consecutive stats ticks: enable cap
+    - `max_new_flows_per_sec=2`
+    - `max_active_flows=current+4`
+  - if RTT p95 < `150ms` for `3` consecutive ticks: disable cap
 - `survival` prefers TCP session/relay path over QUIC.
 
 Live decisions and stats:
 
 - mode/transport switches are logged with reasons
+- RTT probe is sent every `1s` over active session transport (`PING`/`PONG` token echo)
 - periodic stats every `10s`:
   - mode, last transport, active flows
   - total bytes up/down
   - windowed Mbps up/down/total
-  - RTT p95 (setup-latency proxy, if available)
+  - RTT p50/p95 from probe samples in the last `10s` window
   - switches count
+  - adaptive cap state (`caps=...`)
+- stats output format:
+  - `--stats-format text` (default): human-readable log line
+  - `--stats-format json`: one JSON line every `10s` to stdout with fields:
+    - `mode`, `transport`, `active_flows`
+    - `mbps_up`, `mbps_down`, `mbps_total`
+    - `bytes_up`, `bytes_down`
+    - `rtt_p50`, `rtt_p95`
+    - `switches`
+    - `caps` (present when cap is enabled)
 
 Defaults:
 

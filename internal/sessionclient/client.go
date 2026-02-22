@@ -2,6 +2,7 @@ package sessionclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,8 @@ const (
 	TransportTCPSession Transport = "tcp-session"
 	TransportRelay      Transport = "relay"
 )
+
+var ErrRTTProbeUnsupported = errors.New("rtt probe unsupported for current transport")
 
 type DialError struct {
 	QUICErr  error `json:"quic_err,omitempty"`
@@ -49,6 +52,7 @@ type Client struct {
 type clientInner interface {
 	openTCPFlow(ctx context.Context, flowID uint64, dstHost string, dstPort int) (TCPFlow, error)
 	openUDPFlow(ctx context.Context, flowID uint64, dstHost string, dstPort int) (UDPFlow, error)
+	probeRTT(ctx context.Context) (time.Duration, error)
 	close() error
 }
 
@@ -140,6 +144,13 @@ func (c *Client) Close() error {
 		return nil
 	}
 	return c.inner.close()
+}
+
+func (c *Client) ProbeRTT(ctx context.Context) (time.Duration, error) {
+	if c.inner == nil {
+		return 0, io.EOF
+	}
+	return c.inner.probeRTT(ctx)
 }
 
 func debugf(cfg Config, format string, args ...any) {

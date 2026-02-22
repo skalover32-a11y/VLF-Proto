@@ -91,6 +91,10 @@ func (c *relayClient) close() error {
 	return nil
 }
 
+func (c *relayClient) probeRTT(context.Context) (time.Duration, error) {
+	return 0, ErrRTTProbeUnsupported
+}
+
 func (f *relayTCPFlow) ID() uint64 {
 	return f.id
 }

@@ -30,9 +30,10 @@ type tcpSessionClient struct {
 	flowMu sync.RWMutex
 	flows  map[uint64]*tcpFramedFlow
 
-	pendingMu  sync.Mutex
-	pendingTCP map[uint64]chan openResult
-	pendingUDP map[uint64]chan openResult
+	pendingMu   sync.Mutex
+	pendingTCP  map[uint64]chan openResult
+	pendingUDP  map[uint64]chan openResult
+	pendingPing map[string]chan error
 
 	closeOnce sync.Once
 }
@@ -69,14 +70,15 @@ func dialTCPSession(ctx context.Context, cfg Config) (*tcpSessionClient, error) 
 
 	clientCtx, cancelClient := context.WithCancel(context.Background())
 	c := &tcpSessionClient{
-		cfg:        cfg,
-		conn:       conn,
-		reader:     bufio.NewReader(conn),
-		ctx:        clientCtx,
-		cancel:     cancelClient,
-		flows:      make(map[uint64]*tcpFramedFlow),
-		pendingTCP: make(map[uint64]chan openResult),
-		pendingUDP: make(map[uint64]chan openResult),
+		cfg:         cfg,
+		conn:        conn,
+		reader:      bufio.NewReader(conn),
+		ctx:         clientCtx,
+		cancel:      cancelClient,
+		flows:       make(map[uint64]*tcpFramedFlow),
+		pendingTCP:  make(map[uint64]chan openResult),
+		pendingUDP:  make(map[uint64]chan openResult),
+		pendingPing: make(map[string]chan error),
 	}
 
 	if err := c.auth(ctx); err != nil {
@@ -218,6 +220,8 @@ func (c *tcpSessionClient) readLoop() {
 		switch frame.Type {
 		case session.FramePING:
 			_ = c.writeFrame(session.FramePONG, frame.Payload)
+		case session.FramePONG:
+			_ = c.resolvePendingPing(frame.Payload)
 		case session.FrameOPENTCPOK:
 			okPayload, err := session.DecodeOpenOKPayload(frame.Payload)
 			if err != nil {
@@ -285,6 +289,14 @@ func (c *tcpSessionClient) closeWithError(err error) {
 			close(ch)
 			delete(c.pendingUDP, flowID)
 		}
+		for key, ch := range c.pendingPing {
+			select {
+			case ch <- err:
+			default:
+			}
+			close(ch)
+			delete(c.pendingPing, key)
+		}
 		c.pendingMu.Unlock()
 
 		c.flowMu.Lock()
@@ -299,6 +311,42 @@ func (c *tcpSessionClient) closeWithError(err error) {
 func (c *tcpSessionClient) close() error {
 	c.closeWithError(io.EOF)
 	return nil
+}
+
+func (c *tcpSessionClient) probeRTT(ctx context.Context) (time.Duration, error) {
+	probeCtx, cancel := expectTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+
+	token := make([]byte, 12)
+	if _, err := rand.Read(token); err != nil {
+		return 0, wrapErr("random ping token", err)
+	}
+	key := string(token)
+	waitCh := make(chan error, 1)
+
+	c.pendingMu.Lock()
+	c.pendingPing[key] = waitCh
+	c.pendingMu.Unlock()
+
+	start := time.Now()
+	if err := c.writeFrame(session.FramePING, token); err != nil {
+		c.unregisterPendingPing(key)
+		return 0, err
+	}
+
+	select {
+	case err, ok := <-waitCh:
+		if !ok {
+			return 0, io.EOF
+		}
+		if err != nil {
+			return 0, err
+		}
+		return time.Since(start), nil
+	case <-probeCtx.Done():
+		c.unregisterPendingPing(key)
+		return 0, probeCtx.Err()
+	}
 }
 
 func (c *tcpSessionClient) writeFrame(frameType uint64, payload []byte) error {
@@ -371,6 +419,35 @@ func (c *tcpSessionClient) unregisterPendingUDP(flowID uint64) {
 	if ch != nil {
 		close(ch)
 	}
+}
+
+func (c *tcpSessionClient) unregisterPendingPing(key string) {
+	c.pendingMu.Lock()
+	ch := c.pendingPing[key]
+	delete(c.pendingPing, key)
+	c.pendingMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+func (c *tcpSessionClient) resolvePendingPing(payload []byte) bool {
+	key := string(payload)
+	c.pendingMu.Lock()
+	ch := c.pendingPing[key]
+	if ch != nil {
+		delete(c.pendingPing, key)
+	}
+	c.pendingMu.Unlock()
+	if ch == nil {
+		return false
+	}
+	select {
+	case ch <- nil:
+	default:
+	}
+	close(ch)
+	return true
 }
 
 func (f *tcpFramedFlow) ID() uint64 {
