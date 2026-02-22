@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -59,6 +60,8 @@ const (
 	capDisableConsecutive   = 3
 	capMaxNewFlowsPerSecond = 2
 	capActiveFlowsMargin    = 4
+
+	udpQUICBackoff = 30 * time.Second
 )
 
 const (
@@ -147,6 +150,7 @@ type policyController struct {
 	configured  clientMode
 	currentMode clientMode
 	statsFormat statsFormat
+	closeOnce   sync.Once
 
 	mu            sync.Mutex
 	nextFlowID    uint64
@@ -240,6 +244,9 @@ type udpManager struct {
 
 	stopCh chan struct{}
 	doneCh chan struct{}
+
+	quicBlockedUntil atomic.Int64
+	quicBlockedAt    atomic.Int64
 }
 
 type cleanupStack struct {
@@ -457,9 +464,20 @@ func main() {
 
 	_ = dev.Close()
 	udpMgr.Close()
+	controller.Close()
 	ep.Close()
 	ep.Wait()
-	wg.Wait()
+
+	waitDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-time.After(5 * time.Second):
+		log.Printf("shutdown timeout waiting workers; active_flows=%d", controller.ActiveFlowCount())
+	}
 }
 
 func ensureElevated() error {
@@ -1031,6 +1049,15 @@ func (m *udpManager) Handle(local net.Conn, id stack.TransportEndpointID) {
 }
 
 func (m *udpManager) runState(st *udpFlowState) {
+	if m.isQUICBlocked() {
+		if st.dstPort == 53 {
+			m.runDNSFallback(st)
+			return
+		}
+		m.closeState(st, "udp_quic_temporarily_blocked")
+		return
+	}
+
 	admissionCtx, cancelAdmission := context.WithTimeout(context.Background(), m.connectTimeout)
 	if err := m.controller.acquireFlowPermit(admissionCtx); err != nil {
 		cancelAdmission()
@@ -1051,9 +1078,14 @@ func (m *udpManager) runState(st *udpFlowState) {
 			m.controller.releaseFlowPermit()
 			permitHeld = false
 		}
+		m.noteQUICDialError(err)
 		m.controller.onDialError(cfg, err)
 		log.Printf("udp session dial failed mode=%s for %s:%d -> %s:%d target=%s:%d: %v",
 			mode, st.srcIP, st.srcPort, st.dstIP, st.dstPort, st.targetHost, st.targetPort, err)
+		if st.dstPort == 53 {
+			m.runDNSFallback(st)
+			return
+		}
 		m.closeState(st, "udp_dial_failed")
 		return
 	}
@@ -1069,8 +1101,13 @@ func (m *udpManager) runState(st *udpFlowState) {
 			permitHeld = false
 		}
 		m.controller.onTransportError("open_udp_flow_failed")
+		m.noteQUICDialError(err)
 		log.Printf("open udp flow failed mode=%s for %s:%d -> %s:%d target=%s:%d: %v",
 			mode, st.srcIP, st.srcPort, st.dstIP, st.dstPort, st.targetHost, st.targetPort, err)
+		if st.dstPort == 53 {
+			m.runDNSFallback(st)
+			return
+		}
 		m.closeState(st, "udp_open_failed")
 		return
 	}
@@ -1200,6 +1237,213 @@ func (m *udpManager) closeState(st *udpFlowState, reason string) {
 	})
 }
 
+func (m *udpManager) isQUICBlocked() bool {
+	return time.Now().UnixNano() < m.quicBlockedUntil.Load()
+}
+
+func (m *udpManager) noteQUICDialError(err error) {
+	if err == nil {
+		return
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "no application protocol") &&
+		!strings.Contains(msg, "crypto_error 0x178") &&
+		!strings.Contains(msg, "no recent network activity") {
+		return
+	}
+
+	until := time.Now().Add(udpQUICBackoff).UnixNano()
+	m.quicBlockedUntil.Store(until)
+
+	now := time.Now().UnixNano()
+	last := m.quicBlockedAt.Load()
+	if now-last > int64(5*time.Second) && m.quicBlockedAt.CompareAndSwap(last, now) {
+		log.Printf("udp quic path temporarily disabled for %s due to dial error: %v", udpQUICBackoff, err)
+	}
+}
+
+func (m *udpManager) runDNSFallback(st *udpFlowState) {
+	log.Printf("dns fallback over tcp flow for key=%s resolver=%s:%d", st.key, m.opts.DNSResolverHost, m.opts.DNSResolverPort)
+
+	buf := make([]byte, 64*1024)
+	for {
+		if err := st.local.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			m.closeState(st, "dns_fallback_set_deadline_failed")
+			return
+		}
+		n, err := st.local.Read(buf)
+		if n > 0 {
+			query := make([]byte, n)
+			copy(query, buf[:n])
+
+			resp, qErr := m.dnsQueryOverTCP(st.ctx, query)
+			if qErr != nil {
+				log.Printf("dns fallback query failed key=%s: %v", st.key, qErr)
+				m.closeState(st, "dns_fallback_query_failed")
+				return
+			}
+			if len(resp) == 0 {
+				continue
+			}
+
+			if err := st.local.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				m.closeState(st, "dns_fallback_set_write_deadline_failed")
+				return
+			}
+			if _, err := st.local.Write(resp); err != nil {
+				if isExpectedUDPErr(err) {
+					m.closeState(st, "dns_fallback_local_closed")
+					return
+				}
+				m.closeState(st, "dns_fallback_write_failed")
+				return
+			}
+			st.lastActive.Store(time.Now().UnixNano())
+		}
+
+		if err != nil {
+			if isTimeoutErr(err) {
+				select {
+				case <-st.ctx.Done():
+					m.closeState(st, "dns_fallback_ctx_done")
+					return
+				default:
+					continue
+				}
+			}
+			if isExpectedUDPErr(err) {
+				m.closeState(st, "dns_fallback_local_closed")
+				return
+			}
+			m.closeState(st, "dns_fallback_local_read_error")
+			return
+		}
+	}
+}
+
+func (m *udpManager) dnsQueryOverTCP(ctx context.Context, query []byte) ([]byte, error) {
+	if len(query) == 0 || len(query) > 65535 {
+		return nil, fmt.Errorf("invalid dns query size=%d", len(query))
+	}
+
+	admissionCtx, cancelAdmission := context.WithTimeout(ctx, m.connectTimeout)
+	if err := m.controller.acquireFlowPermit(admissionCtx); err != nil {
+		cancelAdmission()
+		return nil, err
+	}
+	cancelAdmission()
+	permitHeld := true
+
+	cfg, mode := m.controller.dialConfig()
+	setupStart := time.Now()
+
+	dialCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
+	client, err := sessionclient.Dial(dialCtx, cfg)
+	cancel()
+	if err != nil {
+		if permitHeld {
+			m.controller.releaseFlowPermit()
+			permitHeld = false
+		}
+		m.controller.onDialError(cfg, err)
+		return nil, fmt.Errorf("dns dial mode=%s: %w", mode, err)
+	}
+	m.controller.onDialSuccess(mode, cfg, client.Transport())
+
+	openCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
+	flow, err := client.OpenTCPFlow(openCtx, m.opts.DNSResolverHost, m.opts.DNSResolverPort)
+	cancel()
+	if err != nil {
+		if permitHeld {
+			m.controller.releaseFlowPermit()
+			permitHeld = false
+		}
+		m.controller.onTransportError("dns_open_tcp_failed")
+		_ = client.Close()
+		return nil, err
+	}
+
+	fs := m.controller.registerFlow(client, client.Transport(), time.Since(setupStart))
+	permitHeld = false
+	defer m.controller.unregisterFlow(fs.id)
+	defer flow.Close()
+	defer client.Close()
+
+	frame := make([]byte, 2+len(query))
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(query)))
+	copy(frame[2:], query)
+
+	if err := writeWithTimeout(ctx, flow, frame, m.connectTimeout); err != nil {
+		m.controller.onTransportError("dns_tcp_write")
+		return nil, err
+	}
+	fs.upBytes.Add(int64(len(query)))
+	m.controller.totalUpBytes.Add(int64(len(query)))
+
+	headerRaw, err := readNWithTimeout(ctx, flow, 2, m.connectTimeout)
+	if err != nil {
+		m.controller.onTransportError("dns_tcp_read_len")
+		return nil, err
+	}
+	respLen := int(binary.BigEndian.Uint16(headerRaw))
+	if respLen <= 0 || respLen > 65535 {
+		return nil, fmt.Errorf("invalid dns response length=%d", respLen)
+	}
+	resp, err := readNWithTimeout(ctx, flow, respLen, m.connectTimeout)
+	if err != nil {
+		m.controller.onTransportError("dns_tcp_read_payload")
+		return nil, err
+	}
+	fs.downBytes.Add(int64(len(resp)))
+	m.controller.totalDownBytes.Add(int64(len(resp)))
+	return resp, nil
+}
+
+func writeWithTimeout(ctx context.Context, w io.Writer, data []byte, timeout time.Duration) error {
+	ch := make(chan error, 1)
+	go func() {
+		_, err := w.Write(data)
+		ch <- err
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-ch:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return context.DeadlineExceeded
+	}
+}
+
+func readNWithTimeout(ctx context.Context, r io.Reader, n int, timeout time.Duration) ([]byte, error) {
+	ch := make(chan struct {
+		data []byte
+		err  error
+	}, 1)
+	go func() {
+		buf := make([]byte, n)
+		_, err := io.ReadFull(r, buf)
+		ch <- struct {
+			data []byte
+			err  error
+		}{data: buf, err: err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case out := <-ch:
+		return out.data, out.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, context.DeadlineExceeded
+	}
+}
+
 func parseMode(raw string) (clientMode, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case string(modeAuto):
@@ -1247,8 +1491,16 @@ func newPolicyController(baseCfg sessionclient.Config, configured clientMode, sf
 }
 
 func (c *policyController) Close() {
-	close(c.stopCh)
+	c.closeOnce.Do(func() {
+		close(c.stopCh)
+	})
 	<-c.doneCh
+}
+
+func (c *policyController) ActiveFlowCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.flows)
 }
 
 func (c *policyController) loop() {

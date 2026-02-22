@@ -344,10 +344,12 @@ What it configures:
 - on shutdown (Ctrl+C), removes added routes and interface IP settings
 - DNS behavior:
   - with `--dns-override=true` (default), all intercepted UDP/53 is forwarded to `--dns-resolver` (default `1.1.1.1:53`)
+  - if QUIC UDP path is unavailable, DNS requests fall back to DNS-over-TCP through VLF TCP flow
 - UDP behavior:
   - per-flow NAT mapping (5-tuple based)
   - reverse path from VLF UDP flow back into TUN
   - idle timeout via `--udp-idle-timeout` (default `60s`)
+  - if gateway QUIC UDP is rejected (e.g. ALPN mismatch), UDP tunnel attempts are backoff-limited to reduce error storms
 
 Validation:
 
