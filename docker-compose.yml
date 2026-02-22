@@ -10,7 +10,9 @@ services:
       - udp-echo
     ports:
       - "8080:8080"
+      - "443:443"
       - "443:443/udp"
+      - "8443:443/udp"
     volumes:
       - ./config/config.yaml:/app/config/config.yaml:ro
       - ./certs:/app/certs:rw

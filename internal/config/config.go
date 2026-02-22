@@ -44,6 +44,8 @@ type LimitsConfig struct {
 	RelaySendWindowBytes        int   `yaml:"relay_send_window_bytes"`
 	MaxFlowsPerSession          int   `yaml:"max_flows_per_session"`
 	MaxUDPPPS                   int   `yaml:"max_udp_pps"`
+	SessionDatagramWorkers      int   `yaml:"session_datagram_workers"`
+	SessionDatagramQueue        int   `yaml:"session_datagram_queue"`
 	MaxBytesPerMinutePerSession int64 `yaml:"max_bytes_per_minute_per_session"`
 	SessionUpKbps               int   `yaml:"session_up_kbps"`
 	SessionDownKbps             int   `yaml:"session_down_kbps"`
@@ -63,6 +65,7 @@ type AuthConfig struct {
 type Config struct {
 	ListenHTTP        string            `yaml:"listen_http"`
 	ListenQUIC        string            `yaml:"listen_quic"`
+	ListenTCP         string            `yaml:"listen_tcp"`
 	AllowInsecureHTTP bool              `yaml:"allow_insecure_http"`
 	ProtocolID        string            `yaml:"protocol_id"`
 	LogLevel          string            `yaml:"log_level"`
@@ -78,6 +81,7 @@ func Default() *Config {
 	return &Config{
 		ListenHTTP:        ":8080",
 		ListenQUIC:        ":443",
+		ListenTCP:         ":443",
 		AllowInsecureHTTP: true,
 		ProtocolID:        "vlf-runtime/0.1",
 		LogLevel:          "info",
@@ -98,6 +102,8 @@ func Default() *Config {
 			RelaySendWindowBytes:        64 * 1024,
 			MaxFlowsPerSession:          128,
 			MaxUDPPPS:                   2000,
+			SessionDatagramWorkers:      4,
+			SessionDatagramQueue:        4096,
 			MaxBytesPerMinutePerSession: 64 * 1024 * 1024,
 			SessionUpKbps:               20000,
 			SessionDownKbps:             20000,
@@ -138,6 +144,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ListenQUIC == "" {
 		c.ListenQUIC = def.ListenQUIC
+	}
+	if c.ListenTCP == "" {
+		c.ListenTCP = def.ListenTCP
 	}
 	if c.ProtocolID == "" {
 		c.ProtocolID = def.ProtocolID
@@ -180,6 +189,12 @@ func (c *Config) applyDefaults() {
 	if c.Limits.MaxUDPPPS == 0 {
 		c.Limits.MaxUDPPPS = def.Limits.MaxUDPPPS
 	}
+	if c.Limits.SessionDatagramWorkers == 0 {
+		c.Limits.SessionDatagramWorkers = def.Limits.SessionDatagramWorkers
+	}
+	if c.Limits.SessionDatagramQueue == 0 {
+		c.Limits.SessionDatagramQueue = def.Limits.SessionDatagramQueue
+	}
 	if c.Limits.MaxBytesPerMinutePerSession == 0 {
 		c.Limits.MaxBytesPerMinutePerSession = def.Limits.MaxBytesPerMinutePerSession
 	}
@@ -220,6 +235,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Limits.RelaySendWindowBytes <= 0 {
 		return errors.New("limits.relay_send_window_bytes must be > 0")
+	}
+	if c.Limits.SessionDatagramWorkers <= 0 {
+		return errors.New("limits.session_datagram_workers must be > 0")
+	}
+	if c.Limits.SessionDatagramQueue <= 0 {
+		return errors.New("limits.session_datagram_queue must be > 0")
 	}
 	if c.Timeouts.RelayIdle.Duration <= 0 {
 		return errors.New("timeouts.relay_idle must be > 0")

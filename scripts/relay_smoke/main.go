@@ -41,8 +41,12 @@ type closeResp struct {
 
 func main() {
 	baseURL := envOr("GATEWAY_URL", "http://localhost:8080")
-	clientID := envOr("VLF_CLIENT_ID", "smoke-client")
-	secret := envOr("VLF_SECRET", "smoke-secret")
+	clientID := envAny("smoke-client", "VLF_CLIENT_ID", "VLF_CLIENT")
+	secretRaw := envOr("VLF_SECRET", "smoke-secret")
+	secret, err := auth.ParseSecretString(secretRaw)
+	if err != nil {
+		log.Fatalf("invalid VLF_SECRET format: %v", err)
+	}
 	dstHost := envOr("DST_HOST", "tcp-echo")
 	dstPort := envOrInt("DST_PORT", 9000)
 
@@ -123,7 +127,7 @@ func main() {
 	fmt.Println("PASS relay smoke")
 }
 
-func doJSON(client *http.Client, baseURL, clientID, secret, method, fullPath string, body []byte, out any) error {
+func doJSON(client *http.Client, baseURL, clientID string, secret []byte, method, fullPath string, body []byte, out any) error {
 	req, err := signedRequest(baseURL, clientID, secret, method, fullPath, body)
 	if err != nil {
 		return err
@@ -148,7 +152,7 @@ func doJSON(client *http.Client, baseURL, clientID, secret, method, fullPath str
 	return nil
 }
 
-func doRecv(client *http.Client, baseURL, clientID, secret, fullPath string) ([]byte, bool, int, error) {
+func doRecv(client *http.Client, baseURL, clientID string, secret []byte, fullPath string) ([]byte, bool, int, error) {
 	req, err := signedRequest(baseURL, clientID, secret, http.MethodGet, fullPath, nil)
 	if err != nil {
 		return nil, false, 0, err
@@ -173,7 +177,7 @@ func doRecv(client *http.Client, baseURL, clientID, secret, fullPath string) ([]
 	return raw, eos, resp.StatusCode, nil
 }
 
-func signedRequest(baseURL, clientID, secret, method, fullPath string, body []byte) (*http.Request, error) {
+func signedRequest(baseURL, clientID string, secret []byte, method, fullPath string, body []byte) (*http.Request, error) {
 	if body == nil {
 		body = []byte{}
 	}
@@ -213,8 +217,8 @@ func signedRequest(baseURL, clientID, secret, method, fullPath string, body []by
 	return req, nil
 }
 
-func signHex(secret string, payload string) string {
-	mac := hmac.New(sha256.New, []byte(secret))
+func signHex(secret []byte, payload string) string {
+	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write([]byte(payload))
 	return hex.EncodeToString(mac.Sum(nil))
 }
@@ -230,6 +234,15 @@ func randomHex(n int) (string, error) {
 func envOr(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func envAny(fallback string, names ...string) string {
+	for _, name := range names {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
 	}
 	return fallback
 }

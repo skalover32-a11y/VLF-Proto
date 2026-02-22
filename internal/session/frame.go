@@ -22,6 +22,7 @@ const (
 	FrameCLOSEFLOW
 	FramePING
 	FramePONG
+	FrameTCPDATA
 )
 
 const (
@@ -262,6 +263,20 @@ func EncodeAuthFail(reason string) []byte {
 	b := &bytes.Buffer{}
 	writeString(b, reason)
 	return b.Bytes()
+}
+
+func EncodeTCPDataPayload(flowID uint64, data []byte) []byte {
+	out := make([]byte, 8+len(data))
+	binary.BigEndian.PutUint64(out[:8], flowID)
+	copy(out[8:], data)
+	return out
+}
+
+func DecodeTCPDataPayload(raw []byte) (flowID uint64, data []byte, err error) {
+	if len(raw) < 8 {
+		return 0, nil, fmt.Errorf("tcp data payload too short: %d", len(raw))
+	}
+	return binary.BigEndian.Uint64(raw[:8]), append([]byte(nil), raw[8:]...), nil
 }
 
 func writeString(w io.Writer, s string) {

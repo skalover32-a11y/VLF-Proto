@@ -1,5 +1,6 @@
 listen_http: ":8080"
 listen_quic: ":443"
+listen_tcp: ":443"
 allow_insecure_http: true
 protocol_id: "vlf-runtime/0.1"
 log_level: "info"
@@ -25,6 +26,8 @@ limits:
   relay_send_window_bytes: 65536
   max_flows_per_session: 128
   max_udp_pps: 2000
+  session_datagram_workers: 4
+  session_datagram_queue: 4096
   max_bytes_per_minute_per_session: 67108864
   session_up_kbps: 20000
   session_down_kbps: 20000
