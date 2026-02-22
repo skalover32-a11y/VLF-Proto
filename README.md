@@ -299,6 +299,60 @@ QUIC-blocked simulation:
 ./socks_client --server <gateway-host> --port 443 --mode auto --disable-quic
 ```
 
+## TUN Mode Stage 1 (Windows, TCP only)
+
+`cmd/tun_client` adds full-system TCP tunneling via Wintun + gVisor netstack.
+
+Stage 1 scope:
+
+- Windows only
+- IPv4 only
+- TCP only (no DNS/UDP interception yet)
+- policy stack is the same as SOCKS client:
+  - `--mode auto|normal|fast|survival`
+  - RTT probe every `1s`
+  - adaptive concurrency caps in `auto`
+  - `--stats-format text|json`
+
+Build:
+
+```bash
+go build ./cmd/tun_client
+```
+
+Run (Administrator PowerShell):
+
+```powershell
+.\tun_client.exe --server <gateway-host> --port 443 --mtu 1350
+```
+
+What Stage 1 configures:
+
+- creates/reuses Wintun interface (`--tun-name`, default `VLF-TUN`)
+- sets IPv4 address `198.18.0.2/15` and gateway `198.18.0.1`
+- installs split default routes:
+  - `0.0.0.0/1` via `198.18.0.1`
+  - `128.0.0.0/1` via `198.18.0.1`
+- adds explicit `/32` bypass route for resolved gateway server IP through the original route to avoid routing loops
+- on shutdown (Ctrl+C), removes added routes and interface IP settings
+
+Validation:
+
+1. Start `tun_client` as Administrator.
+2. Open Edge (no proxy settings).
+3. Navigate to `https://api.ipify.org`.
+4. Expected: returned IP matches gateway egress IP.
+
+Troubleshooting:
+
+- If startup fails with admin error, relaunch terminal elevated.
+- If internet path looks broken after crash, restart `tun_client` and exit cleanly once, or remove routes manually:
+  - `Get-NetRoute -DestinationPrefix '0.0.0.0/1','128.0.0.0/1' | Remove-NetRoute -Confirm:$false`
+- If QUIC is blocked in the network, run with fallback preference:
+  - `.\tun_client.exe --server <gateway-host> --port 443 --mode auto --disable-quic`
+- If interface creation fails, verify Wintun driver installation and endpoint security software policies.
+- Stage 1 does not tunnel UDP/DNS yet; DNS/UDP support is planned for later stages.
+
 ## Relay lane API v0.1
 
 Base path: `/v1/relay/*`
