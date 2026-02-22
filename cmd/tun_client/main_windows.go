@@ -91,6 +91,7 @@ type flowState struct {
 	startedAt time.Time
 	transport sessionclient.Transport
 	client    *sessionclient.Client
+	clientKey string
 
 	upBytes   atomic.Int64
 	downBytes atomic.Int64
@@ -155,6 +156,7 @@ type policyController struct {
 	mu            sync.Mutex
 	nextFlowID    uint64
 	flows         map[uint64]*flowState
+	clients       map[string]*managedClient
 	lastTransport sessionclient.Transport
 	switches      uint64
 
@@ -183,6 +185,15 @@ type policyController struct {
 
 	stopCh chan struct{}
 	doneCh chan struct{}
+}
+
+type managedClient struct {
+	key       string
+	client    *sessionclient.Client
+	transport sessionclient.Transport
+	refCount  int
+	broken    bool
+	lastUsed  time.Time
 }
 
 type tunReadWriter struct {
@@ -226,9 +237,10 @@ type udpFlowState struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	client  *sessionclient.Client
-	udpFlow sessionclient.UDPFlow
-	flowRef *flowState
+	client    *sessionclient.Client
+	clientKey string
+	udpFlow   sessionclient.UDPFlow
+	flowRef   *flowState
 
 	lastActive atomic.Int64
 	closeOnce  sync.Once
@@ -898,7 +910,7 @@ func handleTCPFromTun(local net.Conn, controller *policyController, connectTimeo
 	setupStart := time.Now()
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), connectTimeout)
-	client, err := sessionclient.Dial(dialCtx, cfg)
+	client, transport, clientKey, dialed, err := controller.acquireClient(dialCtx, cfg)
 	cancel()
 	if err != nil {
 		if permitHeld {
@@ -909,7 +921,9 @@ func handleTCPFromTun(local net.Conn, controller *policyController, connectTimeo
 		log.Printf("session dial failed mode=%s for %s:%d -> %s:%d: %v", mode, srcIP, srcPort, dstIP, dstPort, err)
 		return
 	}
-	controller.onDialSuccess(mode, cfg, client.Transport())
+	if dialed {
+		controller.onDialSuccess(mode, cfg, transport)
+	}
 
 	openCtx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	flow, err := client.OpenTCPFlow(openCtx, dstIP, dstPort)
@@ -920,16 +934,17 @@ func handleTCPFromTun(local net.Conn, controller *policyController, connectTimeo
 			permitHeld = false
 		}
 		controller.onTransportError("open_tcp_flow_failed")
-		_ = client.Close()
+		controller.markClientBad(clientKey, err)
+		controller.releaseClient(clientKey)
 		log.Printf("open tcp flow failed mode=%s for %s:%d -> %s:%d: %v", mode, srcIP, srcPort, dstIP, dstPort, err)
 		return
 	}
 
-	fs := controller.registerFlow(client, client.Transport(), time.Since(setupStart))
+	fs := controller.registerFlow(client, clientKey, transport, time.Since(setupStart))
 	permitHeld = false
 
-	log.Printf("tun tcp %s:%d -> %s:%d via %s mode=%s flow_id=%d", srcIP, srcPort, dstIP, dstPort, client.Transport(), mode, fs.id)
-	proxyBidirectional(local, flow, client, controller, fs)
+	log.Printf("tun tcp %s:%d -> %s:%d via %s mode=%s flow_id=%d", srcIP, srcPort, dstIP, dstPort, transport, mode, fs.id)
+	proxyBidirectional(local, flow, controller, fs)
 }
 
 func parseResolver(raw string) (string, int, error) {
@@ -1093,7 +1108,7 @@ func (m *udpManager) runState(st *udpFlowState) {
 	setupStart := time.Now()
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), m.connectTimeout)
-	client, err := sessionclient.Dial(dialCtx, cfg)
+	client, transport, clientKey, dialed, err := m.controller.acquireClient(dialCtx, cfg)
 	cancel()
 	if err != nil {
 		if permitHeld {
@@ -1111,8 +1126,11 @@ func (m *udpManager) runState(st *udpFlowState) {
 		m.closeState(st, "udp_dial_failed")
 		return
 	}
-	m.controller.onDialSuccess(mode, cfg, client.Transport())
+	if dialed {
+		m.controller.onDialSuccess(mode, cfg, transport)
+	}
 	st.client = client
+	st.clientKey = clientKey
 
 	openCtx, cancel := context.WithTimeout(context.Background(), m.connectTimeout)
 	udpFlow, err := client.OpenUDPFlow(openCtx, st.targetHost, st.targetPort)
@@ -1124,6 +1142,10 @@ func (m *udpManager) runState(st *udpFlowState) {
 		}
 		m.controller.onTransportError("open_udp_flow_failed")
 		m.noteQUICDialError(err)
+		m.controller.markClientBad(clientKey, err)
+		m.controller.releaseClient(clientKey)
+		st.client = nil
+		st.clientKey = ""
 		log.Printf("open udp flow failed mode=%s for %s:%d -> %s:%d target=%s:%d: %v",
 			mode, st.srcIP, st.srcPort, st.dstIP, st.dstPort, st.targetHost, st.targetPort, err)
 		if st.dstPort == 53 {
@@ -1135,12 +1157,12 @@ func (m *udpManager) runState(st *udpFlowState) {
 	}
 	st.udpFlow = udpFlow
 
-	fs := m.controller.registerFlow(client, client.Transport(), time.Since(setupStart))
+	fs := m.controller.registerFlow(client, clientKey, transport, time.Since(setupStart))
 	st.flowRef = fs
 	permitHeld = false
 
 	log.Printf("tun udp %s:%d -> %s:%d target=%s:%d via %s mode=%s flow_id=%d",
-		st.srcIP, st.srcPort, st.dstIP, st.dstPort, st.targetHost, st.targetPort, client.Transport(), mode, fs.id)
+		st.srcIP, st.srcPort, st.dstIP, st.dstPort, st.targetHost, st.targetPort, transport, mode, fs.id)
 
 	errCh := make(chan error, 2)
 	go func() { errCh <- m.localToRemote(st) }()
@@ -1149,6 +1171,7 @@ func (m *udpManager) runState(st *udpFlowState) {
 	err = <-errCh
 	if !isExpectedUDPErr(err) {
 		m.controller.onTransportError("udp_pump_error")
+		m.controller.markClientBad(st.clientKey, err)
 		log.Printf("udp pump ended with error key=%s: %v", st.key, err)
 	}
 	m.closeState(st, "udp_pump_end")
@@ -1245,12 +1268,13 @@ func (m *udpManager) closeState(st *udpFlowState, reason string) {
 		if st.udpFlow != nil {
 			_ = st.udpFlow.Close()
 		}
-		if st.client != nil {
-			_ = st.client.Close()
-		}
 		if st.flowRef != nil {
 			m.controller.unregisterFlow(st.flowRef.id)
+		} else if st.clientKey != "" {
+			m.controller.releaseClient(st.clientKey)
 		}
+		st.client = nil
+		st.clientKey = ""
 
 		m.mu.Lock()
 		delete(m.flows, st.key)
@@ -1360,7 +1384,7 @@ func (m *udpManager) dnsQueryOverTCP(ctx context.Context, query []byte) ([]byte,
 	setupStart := time.Now()
 
 	dialCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
-	client, err := sessionclient.Dial(dialCtx, cfg)
+	client, transport, clientKey, dialed, err := m.controller.acquireClient(dialCtx, cfg)
 	cancel()
 	if err != nil {
 		if permitHeld {
@@ -1370,7 +1394,9 @@ func (m *udpManager) dnsQueryOverTCP(ctx context.Context, query []byte) ([]byte,
 		m.controller.onDialError(cfg, err)
 		return nil, fmt.Errorf("dns dial mode=%s: %w", mode, err)
 	}
-	m.controller.onDialSuccess(mode, cfg, client.Transport())
+	if dialed {
+		m.controller.onDialSuccess(mode, cfg, transport)
+	}
 
 	openCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
 	flow, err := client.OpenTCPFlow(openCtx, m.opts.DNSResolverHost, m.opts.DNSResolverPort)
@@ -1381,15 +1407,15 @@ func (m *udpManager) dnsQueryOverTCP(ctx context.Context, query []byte) ([]byte,
 			permitHeld = false
 		}
 		m.controller.onTransportError("dns_open_tcp_failed")
-		_ = client.Close()
+		m.controller.markClientBad(clientKey, err)
+		m.controller.releaseClient(clientKey)
 		return nil, err
 	}
 
-	fs := m.controller.registerFlow(client, client.Transport(), time.Since(setupStart))
+	fs := m.controller.registerFlow(client, clientKey, transport, time.Since(setupStart))
 	permitHeld = false
 	defer m.controller.unregisterFlow(fs.id)
 	defer flow.Close()
-	defer client.Close()
 
 	frame := make([]byte, 2+len(query))
 	binary.BigEndian.PutUint16(frame[:2], uint16(len(query)))
@@ -1397,6 +1423,7 @@ func (m *udpManager) dnsQueryOverTCP(ctx context.Context, query []byte) ([]byte,
 
 	if err := writeWithTimeout(ctx, flow, frame, m.connectTimeout); err != nil {
 		m.controller.onTransportError("dns_tcp_write")
+		m.controller.markClientBad(clientKey, err)
 		return nil, err
 	}
 	fs.upBytes.Add(int64(len(query)))
@@ -1405,6 +1432,7 @@ func (m *udpManager) dnsQueryOverTCP(ctx context.Context, query []byte) ([]byte,
 	headerRaw, err := readNWithTimeout(ctx, flow, 2, m.connectTimeout)
 	if err != nil {
 		m.controller.onTransportError("dns_tcp_read_len")
+		m.controller.markClientBad(clientKey, err)
 		return nil, err
 	}
 	respLen := int(binary.BigEndian.Uint16(headerRaw))
@@ -1414,6 +1442,7 @@ func (m *udpManager) dnsQueryOverTCP(ctx context.Context, query []byte) ([]byte,
 	resp, err := readNWithTimeout(ctx, flow, respLen, m.connectTimeout)
 	if err != nil {
 		m.controller.onTransportError("dns_tcp_read_payload")
+		m.controller.markClientBad(clientKey, err)
 		return nil, err
 	}
 	fs.downBytes.Add(int64(len(resp)))
@@ -1504,6 +1533,7 @@ func newPolicyController(baseCfg sessionclient.Config, configured clientMode, sf
 		currentMode: initial,
 		statsFormat: sf,
 		flows:       make(map[uint64]*flowState),
+		clients:     make(map[string]*managedClient),
 		stopCh:      make(chan struct{}),
 		doneCh:      make(chan struct{}),
 		lastStatsAt: time.Now(),
@@ -1517,6 +1547,21 @@ func (c *policyController) Close() {
 		close(c.stopCh)
 	})
 	<-c.doneCh
+
+	c.mu.Lock()
+	snapshot := make([]*sessionclient.Client, 0, len(c.clients))
+	for key, mc := range c.clients {
+		if mc == nil || mc.client == nil {
+			continue
+		}
+		snapshot = append(snapshot, mc.client)
+		delete(c.clients, key)
+	}
+	c.mu.Unlock()
+
+	for _, client := range snapshot {
+		_ = client.Close()
+	}
 }
 
 func (c *policyController) ActiveFlowCount() int {
@@ -1558,6 +1603,105 @@ func (c *policyController) dialConfigUDP() (sessionclient.Config, clientMode) {
 	return cfg, mode
 }
 
+func (c *policyController) acquireClient(ctx context.Context, cfg sessionclient.Config) (*sessionclient.Client, sessionclient.Transport, string, bool, error) {
+	key := clientConfigKey(cfg)
+	now := time.Now()
+
+	c.mu.Lock()
+	if mc := c.clients[key]; mc != nil && mc.client != nil && !mc.broken {
+		mc.refCount++
+		mc.lastUsed = now
+		client := mc.client
+		transport := mc.transport
+		c.mu.Unlock()
+		return client, transport, key, false, nil
+	}
+	c.mu.Unlock()
+
+	client, err := sessionclient.Dial(ctx, cfg)
+	if err != nil {
+		return nil, "", key, false, err
+	}
+	transport := client.Transport()
+
+	c.mu.Lock()
+	if mc := c.clients[key]; mc != nil && mc.client != nil && !mc.broken {
+		mc.refCount++
+		mc.lastUsed = now
+		existing := mc.client
+		existingTransport := mc.transport
+		c.mu.Unlock()
+		_ = client.Close()
+		return existing, existingTransport, key, false, nil
+	}
+
+	c.clients[key] = &managedClient{
+		key:       key,
+		client:    client,
+		transport: transport,
+		refCount:  1,
+		lastUsed:  now,
+	}
+	c.mu.Unlock()
+
+	return client, transport, key, true, nil
+}
+
+func (c *policyController) releaseClient(key string) {
+	if key == "" {
+		return
+	}
+
+	var closeClient *sessionclient.Client
+	c.mu.Lock()
+	mc := c.clients[key]
+	if mc == nil {
+		c.mu.Unlock()
+		return
+	}
+	if mc.refCount > 0 {
+		mc.refCount--
+	}
+	if mc.refCount == 0 && mc.broken {
+		closeClient = mc.client
+		delete(c.clients, key)
+	}
+	c.mu.Unlock()
+
+	if closeClient != nil {
+		_ = closeClient.Close()
+	}
+}
+
+func (c *policyController) markClientBad(key string, err error) {
+	if key == "" || !isSessionClientFatalErr(err) {
+		return
+	}
+
+	var closeClient *sessionclient.Client
+	c.mu.Lock()
+	mc := c.clients[key]
+	if mc == nil {
+		c.mu.Unlock()
+		return
+	}
+	if mc.broken {
+		c.mu.Unlock()
+		return
+	}
+
+	mc.broken = true
+	if mc.refCount == 0 {
+		closeClient = mc.client
+		delete(c.clients, key)
+	}
+	c.mu.Unlock()
+
+	if closeClient != nil {
+		_ = closeClient.Close()
+	}
+}
+
 func (c *policyController) configForMode(mode clientMode) sessionclient.Config {
 	cfg := c.baseCfg
 	switch mode {
@@ -1596,7 +1740,7 @@ func (c *policyController) onTransportError(reason string) {
 	c.recordTransportError(reason)
 }
 
-func (c *policyController) registerFlow(client *sessionclient.Client, transport sessionclient.Transport, setupDuration time.Duration) *flowState {
+func (c *policyController) registerFlow(client *sessionclient.Client, clientKey string, transport sessionclient.Transport, setupDuration time.Duration) *flowState {
 	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1611,6 +1755,7 @@ func (c *policyController) registerFlow(client *sessionclient.Client, transport 
 		startedAt: now,
 		transport: transport,
 		client:    client,
+		clientKey: clientKey,
 	}
 	c.flows[fs.id] = fs
 
@@ -1633,8 +1778,13 @@ func (c *policyController) registerFlow(client *sessionclient.Client, transport 
 
 func (c *policyController) unregisterFlow(id uint64) {
 	c.mu.Lock()
+	fs := c.flows[id]
 	delete(c.flows, id)
 	c.mu.Unlock()
+
+	if fs != nil {
+		c.releaseClient(fs.clientKey)
+	}
 }
 
 func (c *policyController) acquireFlowPermit(ctx context.Context) error {
@@ -2116,7 +2266,24 @@ func maxDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
-func proxyBidirectional(local net.Conn, remote sessionclient.TCPFlow, client *sessionclient.Client, controller *policyController, fs *flowState) {
+func clientConfigKey(cfg sessionclient.Config) string {
+	return fmt.Sprintf(
+		"%s|%d|%d|%s|%s|%s|%t|%t|%t|%t|%t",
+		strings.ToLower(strings.TrimSpace(cfg.GatewayHost)),
+		cfg.GatewayUDP,
+		cfg.GatewayTCP,
+		strings.TrimSpace(cfg.RelayBase),
+		strings.TrimSpace(cfg.ClientID),
+		strings.TrimSpace(cfg.ProtoID),
+		cfg.PreferQUIC,
+		cfg.DisableQUIC,
+		cfg.DisableTCPSession,
+		cfg.AllowRelay,
+		cfg.ForceIPv4,
+	)
+}
+
+func proxyBidirectional(local net.Conn, remote sessionclient.TCPFlow, controller *policyController, fs *flowState) {
 	defer controller.unregisterFlow(fs.id)
 
 	var closeOnce sync.Once
@@ -2124,7 +2291,6 @@ func proxyBidirectional(local net.Conn, remote sessionclient.TCPFlow, client *se
 		closeOnce.Do(func() {
 			_ = local.Close()
 			_ = remote.Close()
-			_ = client.Close()
 		})
 	}
 
@@ -2155,10 +2321,12 @@ func proxyBidirectional(local net.Conn, remote sessionclient.TCPFlow, client *se
 
 	if !isExpectedPipeErr(first) {
 		controller.onTransportError("proxy_copy_up")
+		controller.markClientBad(fs.clientKey, first)
 		log.Printf("proxy copy ended with error flow_id=%d dir=up: %v", fs.id, first)
 	}
 	if !isExpectedPipeErr(second) {
 		controller.onTransportError("proxy_copy_down")
+		controller.markClientBad(fs.clientKey, second)
 		log.Printf("proxy copy ended with error flow_id=%d dir=down: %v", fs.id, second)
 	}
 }
@@ -2201,4 +2369,19 @@ func isExpectedUDPErr(err error) bool {
 func isTimeoutErr(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
+}
+
+func isSessionClientFatalErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "application error 0x0") ||
+		strings.Contains(msg, "no recent network activity") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "stream reset")
 }
