@@ -26,6 +26,8 @@ param(
 
   [string]$ClientID = "",
   [string]$Secret = "",
+  [string]$PinSPKI = "",
+  [switch]$NoPin,
   [string]$Auth = "none",
   [string]$Username = "",
   [string]$Password = "",
@@ -288,6 +290,25 @@ try {
     $Secret = "smoke-secret"
   }
 
+  $envPin = [Environment]::GetEnvironmentVariable("VLF_PIN_SPKI", "Process")
+  $effectivePin = $envPin
+  if ($NoPin) {
+    $effectivePin = ""
+  } elseif ($PinSPKI -ne "") {
+    $effectivePin = $PinSPKI.Trim()
+  }
+  [Environment]::SetEnvironmentVariable("VLF_PIN_SPKI", $effectivePin, "Process")
+  if ($NoPin) {
+    Write-Host "TLS pinning disabled for this run (-NoPin)."
+  } elseif ($effectivePin) {
+    Write-Host "TLS pinning enabled (VLF_PIN_SPKI set)."
+    if ($effectivePin -eq "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=") {
+      Write-Warning "VLF_PIN_SPKI is SHA256(empty) placeholder; it will fail unless server SPKI really matches it."
+    }
+  } else {
+    Write-Host "TLS pinning disabled (empty VLF_PIN_SPKI)."
+  }
+
   $socksExePath = Resolve-AbsPath -Path $SocksExe -Label "socks_client"
   $singBoxExePath = ""
   if (-not $NoSingBox) {
@@ -374,6 +395,7 @@ try {
       listen = $Listen
       stdout = $socksStdOut
       stderr = $socksStdErr
+      pin_spki = if ($effectivePin) { $effectivePin } else { "" }
     }
     sing_box = @{
       enabled = (-not $NoSingBox)

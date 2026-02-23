@@ -396,6 +396,8 @@ Useful flags:
 - `-SessionDebug` passes `--debug` to `socks_client`
 - `-RunSeconds 120` auto-stop after 120s
 - `-NoSingBox` run only `socks_client` (still with logging)
+- `-NoPin` force-disable TLS pinning for this run (`VLF_PIN_SPKI` cleared in process env)
+- `-PinSPKI "<base64>"` override pin value for this run
 
 Troubleshooting for sing-box TUN (`no internet`, repeated UDP to `172.19.0.2:53`):
 
