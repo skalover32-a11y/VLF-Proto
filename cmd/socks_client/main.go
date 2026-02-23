@@ -1111,6 +1111,9 @@ func handleConn(
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 	req, err := negotiateSOCKS5(conn, authCfg, metrics)
 	if err != nil {
+		if isExpectedSOCKSHandshakeErr(err) {
+			return
+		}
 		log.Printf("SOCKS handshake failed from %s: %v", conn.RemoteAddr(), err)
 		return
 	}
@@ -2181,8 +2184,25 @@ func isExpectedPipeErr(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
 		return true
 	}
-	msg := err.Error()
-	return msg == "use of closed network connection" || msg == "EOF"
+	msg := strings.ToLower(err.Error())
+	return msg == "use of closed network connection" ||
+		msg == "eof" ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "forcibly closed by the remote host") ||
+		strings.Contains(msg, "broken pipe")
+}
+
+func isExpectedSOCKSHandshakeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "read greeting header: eof") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "forcibly closed by the remote host")
 }
 
 func isExpectedProbeErr(err error) bool {
