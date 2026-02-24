@@ -306,7 +306,7 @@ build_gateway_binary() {
   log "building gateway binary"
   (
     cd "${INSTALL_DIR}"
-    CGO_ENABLED=0 "${GO_BIN}" build -trimpath -ldflags='-s -w' -o "${BIN_PATH}" ./cmd/gateway
+    CGO_ENABLED=0 "${GO_BIN}" build -buildvcs=false -trimpath -ldflags='-s -w' -o "${BIN_PATH}" ./cmd/gateway
   )
   run chown root:root "${BIN_PATH}"
   run chmod 0755 "${BIN_PATH}"

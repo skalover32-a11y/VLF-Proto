@@ -137,7 +137,7 @@ update_repo() {
 build_binary() {
   (
     cd "${INSTALL_DIR}"
-    CGO_ENABLED=0 "${GO_BIN}" build -trimpath -ldflags='-s -w' -o "${BIN_PATH}" ./cmd/gateway
+    CGO_ENABLED=0 "${GO_BIN}" build -buildvcs=false -trimpath -ldflags='-s -w' -o "${BIN_PATH}" ./cmd/gateway
   )
   run chmod 0755 "${BIN_PATH}"
   run chown root:root "${BIN_PATH}"
