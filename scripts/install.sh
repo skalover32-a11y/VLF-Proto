@@ -513,7 +513,16 @@ EOF
 }
 
 configure_ufw() {
+  local ufw_active=0
+
+  if need_cmd ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw_active=1
+  fi
+
   if [[ "${ENABLE_UFW}" -ne 1 ]]; then
+    if [[ "${ufw_active}" -eq 1 ]]; then
+      warn "ufw is active, but --ufw is not set; skipping firewall rule changes"
+    fi
     return 0
   fi
 
@@ -521,19 +530,19 @@ configure_ufw() {
     warn "ufw is not installed; skipping firewall rules"
     return 0
   fi
-  if ! ufw status 2>/dev/null | grep -q '^Status: active'; then
+  if [[ "${ufw_active}" -ne 1 ]]; then
     warn "ufw is not enabled; skipping firewall rules"
     return 0
   fi
 
   log "applying UFW rules"
-  run ufw allow "${PORT_TCP}/tcp" >/dev/null
-  run ufw allow "${PORT_UDP}/udp" >/dev/null
+  run ufw allow proto tcp to any port "${PORT_TCP}" >/dev/null
+  run ufw allow proto udp to any port "${PORT_UDP}" >/dev/null
   if [[ "${PORT_UDP_ALT}" != "${PORT_UDP}" ]]; then
-    run ufw allow "${PORT_UDP_ALT}/udp" >/dev/null
+    run ufw allow proto udp to any port "${PORT_UDP_ALT}" >/dev/null
   fi
   if [[ "${ENABLE_METRICS}" -eq 1 && "${METRICS_ADDR}" != "127.0.0.1" && "${METRICS_ADDR}" != "::1" ]]; then
-    run ufw allow "${METRICS_PORT}/tcp" >/dev/null
+    run ufw allow proto tcp to any port "${METRICS_PORT}" >/dev/null
   fi
 }
 

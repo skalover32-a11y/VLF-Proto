@@ -82,6 +82,7 @@ Notes:
 - IP-only mode works out of the box; domain/SNI is optional.
 - `--port-udp-alt` is redirected to `--port-udp` with iptables rules managed by the service.
 - `--no-metrics` disables `/metrics`.
+- `--ufw` applies explicit firewall rules for both TCP and UDP ports (`<port>/tcp` and `<port>/udp`).
 - installer auto-detects public IPv4 and prints IPv6 when available.
 
 Update deployed gateway:
