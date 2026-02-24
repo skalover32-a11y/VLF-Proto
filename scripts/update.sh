@@ -126,11 +126,11 @@ ensure_go() {
 
 update_repo() {
   [[ -d "${INSTALL_DIR}/.git" ]] || die "repo not found in ${INSTALL_DIR}. Run install.sh first."
-  run git -C "${INSTALL_DIR}" remote set-url origin "${REPO_URL}"
-  run git -C "${INSTALL_DIR}" fetch --tags --prune origin
-  run git -C "${INSTALL_DIR}" checkout --force "${REF}"
-  if git -C "${INSTALL_DIR}" rev-parse --verify "origin/${REF}" >/dev/null 2>&1; then
-    run git -C "${INSTALL_DIR}" reset --hard "origin/${REF}"
+  run git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" remote set-url origin "${REPO_URL}"
+  run git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" fetch --tags --prune origin
+  run git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" checkout --force "${REF}"
+  if git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" rev-parse --verify "origin/${REF}" >/dev/null 2>&1; then
+    run git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" reset --hard "origin/${REF}"
   fi
 }
 

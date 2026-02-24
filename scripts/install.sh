@@ -287,17 +287,17 @@ prepare_directories() {
 prepare_repo() {
   if [[ -d "${INSTALL_DIR}/.git" ]]; then
     log "updating existing repo in ${INSTALL_DIR}"
-    run git -C "${INSTALL_DIR}" remote set-url origin "${REPO_URL}"
-    run git -C "${INSTALL_DIR}" fetch --tags --prune origin
-    run git -C "${INSTALL_DIR}" checkout --force "${REF}"
-    if git -C "${INSTALL_DIR}" rev-parse --verify "origin/${REF}" >/dev/null 2>&1; then
-      run git -C "${INSTALL_DIR}" reset --hard "origin/${REF}"
+    run git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" remote set-url origin "${REPO_URL}"
+    run git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" fetch --tags --prune origin
+    run git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" checkout --force "${REF}"
+    if git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" rev-parse --verify "origin/${REF}" >/dev/null 2>&1; then
+      run git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" reset --hard "origin/${REF}"
     fi
   else
     log "cloning ${REPO_URL} -> ${INSTALL_DIR}"
     run rm -rf "${INSTALL_DIR}"
     run git clone "${REPO_URL}" "${INSTALL_DIR}"
-    run git -C "${INSTALL_DIR}" checkout --force "${REF}"
+    run git -c safe.directory="${INSTALL_DIR}" -C "${INSTALL_DIR}" checkout --force "${REF}"
   fi
   run chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${INSTALL_DIR}"
 }
