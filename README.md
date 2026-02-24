@@ -23,6 +23,119 @@ Production-grade MVP gateway in Go with two traffic lanes:
 - `docker-compose.yml`
 - `Dockerfile`
 
+## One-command install (IP and Domain modes)
+
+Production installer scripts are provided for fresh Ubuntu `22.04/24.04` (Debian 12 also works in practice) without Docker runtime dependency.
+
+One-command install (default `main`, IP-only mode):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/main/scripts/install.sh | sudo bash -s --
+```
+
+Install with explicit ref and ports:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/main/scripts/install.sh | sudo bash -s -- \
+  --ref main \
+  --port-tcp 443 \
+  --port-udp 443 \
+  --port-udp-alt 8443 \
+  --metrics-addr 127.0.0.1 \
+  --metrics-port 8080 \
+  --ufw
+```
+
+Install with optional domain/SNI mode:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/main/scripts/install.sh | sudo bash -s -- \
+  --domain your.domain.tld \
+  --tls-server-name your.domain.tld
+```
+
+Re-run on an already installed host:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/main/scripts/install.sh | sudo bash -s -- --force
+```
+
+Installer outputs and files:
+
+- binary: `/usr/local/bin/vlf-gateway`
+- repo checkout: `/opt/vlf-proto`
+- config: `/etc/vlf-proto/config.yaml`
+- env: `/etc/vlf-proto/.env`
+- systemd unit: `/etc/systemd/system/vlf-gateway.service`
+
+Systemd defaults:
+
+- dedicated user: `vlfproto`
+- `Restart=always`, `RestartSec=1`
+- `LimitNOFILE=1048576`
+- `NoNewPrivileges=true`
+- `ProtectSystem=full`, `ProtectHome=true`, `PrivateTmp=true`
+- minimal bind capability: `CAP_NET_BIND_SERVICE`
+
+Notes:
+
+- IP-only mode works out of the box; domain/SNI is optional.
+- `--port-udp-alt` is redirected to `--port-udp` with iptables rules managed by the service.
+- `--no-metrics` disables `/metrics`.
+- installer auto-detects public IPv4 and prints IPv6 when available.
+
+Secure Connect: required minimum parameters:
+
+- `VLF_PUBLIC_IPV4`
+- `VLF_DOMAIN` (optional)
+- `VLF_TLS_SERVER_NAME` (optional)
+- `VLF_PORT_TCP`
+- `VLF_PORT_UDP`
+- `VLF_CLIENT_ID`
+- `VLF_CLIENT_SECRET`
+- `VLF_RELAY_BASE_IP`
+- `VLF_RELAY_BASE_DOMAIN` (optional)
+
+Update deployed gateway:
+
+```bash
+sudo bash /opt/vlf-proto/scripts/update.sh --ref main
+```
+
+Uninstall gateway:
+
+```bash
+sudo bash /opt/vlf-proto/scripts/uninstall.sh
+# full cleanup:
+sudo bash /opt/vlf-proto/scripts/uninstall.sh --purge
+```
+
+Print client env example from installed node:
+
+```bash
+sudo bash /opt/vlf-proto/scripts/print-env-example.sh
+```
+
+Export parameters for Secure Connect:
+
+```bash
+sudo bash /opt/vlf-proto/scripts/print-client-json.sh
+```
+
+Client examples:
+
+IP-only:
+
+```bash
+socks_client --server <PUBLIC_IP> --port-tcp 443 --port-udp 443 --client-id <VLF_CLIENT_ID> --secret <VLF_CLIENT_SECRET> --listen 127.0.0.1:10808
+```
+
+Domain/SNI (optional):
+
+```bash
+socks_client --server <DOMAIN> --tls-server-name <TLS_SERVER_NAME> --port-tcp 443 --port-udp 443 --client-id <VLF_CLIENT_ID> --secret <VLF_CLIENT_SECRET> --listen 127.0.0.1:10808
+```
+
 ## Quick start (Docker)
 
 ```bash
