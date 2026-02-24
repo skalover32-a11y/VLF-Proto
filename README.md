@@ -84,18 +84,6 @@ Notes:
 - `--no-metrics` disables `/metrics`.
 - installer auto-detects public IPv4 and prints IPv6 when available.
 
-Secure Connect: required minimum parameters:
-
-- `VLF_PUBLIC_IPV4`
-- `VLF_DOMAIN` (optional)
-- `VLF_TLS_SERVER_NAME` (optional)
-- `VLF_PORT_TCP`
-- `VLF_PORT_UDP`
-- `VLF_CLIENT_ID`
-- `VLF_CLIENT_SECRET`
-- `VLF_RELAY_BASE_IP`
-- `VLF_RELAY_BASE_DOMAIN` (optional)
-
 Update deployed gateway:
 
 ```bash
@@ -110,31 +98,21 @@ sudo bash /opt/vlf-proto/scripts/uninstall.sh
 sudo bash /opt/vlf-proto/scripts/uninstall.sh --purge
 ```
 
-Print client env example from installed node:
+Diagnostics:
 
 ```bash
-sudo bash /opt/vlf-proto/scripts/print-env-example.sh
+systemctl status vlf-gateway --no-pager
+journalctl -u vlf-gateway -n 200 --no-pager
+ss -lntup | grep -E '(:443\\s|:8443\\s|:8080\\s)'
 ```
 
-Export parameters for Secure Connect:
+Metrics check (if metrics enabled):
 
 ```bash
-sudo bash /opt/vlf-proto/scripts/print-client-json.sh
+curl -fsS http://127.0.0.1:8080/metrics | head
 ```
 
-Client examples:
-
-IP-only:
-
-```bash
-socks_client --server <PUBLIC_IP> --port-tcp 443 --port-udp 443 --client-id <VLF_CLIENT_ID> --secret <VLF_CLIENT_SECRET> --listen 127.0.0.1:10808
-```
-
-Domain/SNI (optional):
-
-```bash
-socks_client --server <DOMAIN> --tls-server-name <TLS_SERVER_NAME> --port-tcp 443 --port-udp 443 --client-id <VLF_CLIENT_ID> --secret <VLF_CLIENT_SECRET> --listen 127.0.0.1:10808
-```
+This installer is backend-only: it only installs and runs the VLF gateway service.
 
 ## Quick start (Docker)
 
