@@ -464,10 +464,10 @@ write_systemd_unit() {
   if [[ "${PORT_UDP_ALT}" != "${PORT_UDP}" ]]; then
     capability_bounding_set="CAP_NET_BIND_SERVICE CAP_NET_ADMIN"
     ambient_capabilities="CAP_NET_BIND_SERVICE CAP_NET_ADMIN"
-    udp_alt_hooks="$(cat <<'EOF'
-ExecStartPre=/bin/bash -lc 'if command -v iptables >/dev/null 2>&1; then iptables -t nat -C PREROUTING -p udp --dport "\${VLF_PORT_UDP_ALT}" -j REDIRECT --to-ports "\${VLF_PORT_UDP}" 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport "\${VLF_PORT_UDP_ALT}" -j REDIRECT --to-ports "\${VLF_PORT_UDP}"; fi'
-ExecStartPre=/bin/bash -lc 'if command -v iptables >/dev/null 2>&1; then iptables -t nat -C OUTPUT -p udp -d 127.0.0.1 --dport "\${VLF_PORT_UDP_ALT}" -j REDIRECT --to-ports "\${VLF_PORT_UDP}" 2>/dev/null || iptables -t nat -A OUTPUT -p udp -d 127.0.0.1 --dport "\${VLF_PORT_UDP_ALT}" -j REDIRECT --to-ports "\${VLF_PORT_UDP}"; fi'
-ExecStopPost=/bin/bash -lc 'if command -v iptables >/dev/null 2>&1; then iptables -t nat -D PREROUTING -p udp --dport "\${VLF_PORT_UDP_ALT}" -j REDIRECT --to-ports "\${VLF_PORT_UDP}" >/dev/null 2>&1 || true; iptables -t nat -D OUTPUT -p udp -d 127.0.0.1 --dport "\${VLF_PORT_UDP_ALT}" -j REDIRECT --to-ports "\${VLF_PORT_UDP}" >/dev/null 2>&1 || true; fi'
+    udp_alt_hooks="$(cat <<EOF
+ExecStartPre=/bin/bash -lc 'if command -v iptables >/dev/null 2>&1; then iptables -t nat -C PREROUTING -p udp --dport "${PORT_UDP_ALT}" -j REDIRECT --to-ports "${PORT_UDP}" 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport "${PORT_UDP_ALT}" -j REDIRECT --to-ports "${PORT_UDP}"; fi'
+ExecStartPre=/bin/bash -lc 'if command -v iptables >/dev/null 2>&1; then iptables -t nat -C OUTPUT -p udp -d 127.0.0.1 --dport "${PORT_UDP_ALT}" -j REDIRECT --to-ports "${PORT_UDP}" 2>/dev/null || iptables -t nat -A OUTPUT -p udp -d 127.0.0.1 --dport "${PORT_UDP_ALT}" -j REDIRECT --to-ports "${PORT_UDP}"; fi'
+ExecStopPost=/bin/bash -lc 'if command -v iptables >/dev/null 2>&1; then iptables -t nat -D PREROUTING -p udp --dport "${PORT_UDP_ALT}" -j REDIRECT --to-ports "${PORT_UDP}" >/dev/null 2>&1 || true; iptables -t nat -D OUTPUT -p udp -d 127.0.0.1 --dport "${PORT_UDP_ALT}" -j REDIRECT --to-ports "${PORT_UDP}" >/dev/null 2>&1 || true; fi'
 EOF
 )"
   fi
