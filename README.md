@@ -85,6 +85,16 @@ Notes:
 - `--ufw` applies explicit firewall rules for both TCP and UDP ports (`<port>/tcp` and `<port>/udp`).
 - installer auto-detects public IPv4 and prints IPv6 when available.
 
+`scripts/install.sh` behavior summary:
+
+- installs dependencies and Go toolchain (when required)
+- clones/ref-updates repository into `/opt/vlf-proto`
+- builds `/usr/local/bin/vlf-gateway` from `./cmd/gateway`
+- writes runtime config into `/etc/vlf-proto` (`.env`, `config.yaml`, `tls.crt`, `tls.key`)
+- creates and enables `vlf-gateway.service` with hardening defaults
+- runs post-install checks (`systemctl`, sockets, `/metrics` when enabled)
+- supports safe reinstall with `--force`
+
 Update deployed gateway:
 
 ```bash
