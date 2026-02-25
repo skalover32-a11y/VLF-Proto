@@ -2,6 +2,7 @@ package sessionclient
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -66,6 +67,7 @@ func dialQUIC(ctx context.Context, cfg Config) (*quicClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	debugf(cfg, "attempting QUIC dial: addr=%s sni=%s alpn=%v timeout=%s", cfg.QUICAddr(), tlsConf.ServerName, tlsConf.NextProtos, cfg.QUICTimeout)
 
 	conn, err := quic.DialAddr(dialCtx, cfg.QUICAddr(), tlsConf, &quic.Config{
 		EnableDatagrams: true,
@@ -237,6 +239,46 @@ func (c *quicClient) openFlow(
 				reason = "open flow rejected"
 			}
 			return errors.New(reason)
+		case session.FramePING:
+			_ = session.WriteFrame(c.control, session.FramePONG, frame.Payload)
+		}
+	}
+}
+
+func (c *quicClient) probeRTT(ctx context.Context) (time.Duration, error) {
+	if c.control == nil {
+		return 0, io.EOF
+	}
+
+	probeCtx, cancel := expectTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+
+	token := make([]byte, 12)
+	if _, err := rand.Read(token); err != nil {
+		binary.BigEndian.PutUint64(token[:8], uint64(time.Now().UnixNano()))
+		binary.BigEndian.PutUint32(token[8:], uint32(time.Now().UnixMilli()))
+	}
+
+	start := time.Now()
+
+	c.ctrlMu.Lock()
+	defer c.ctrlMu.Unlock()
+
+	if err := session.WriteFrame(c.control, session.FramePING, token); err != nil {
+		return 0, err
+	}
+
+	for {
+		frame, err := c.readControlFrameLocked(probeCtx, 1500*time.Millisecond)
+		if err != nil {
+			return 0, err
+		}
+
+		switch frame.Type {
+		case session.FramePONG:
+			if bytes.Equal(frame.Payload, token) {
+				return time.Since(start), nil
+			}
 		case session.FramePING:
 			_ = session.WriteFrame(c.control, session.FramePONG, frame.Payload)
 		}

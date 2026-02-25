@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -30,9 +31,10 @@ type tcpSessionClient struct {
 	flowMu sync.RWMutex
 	flows  map[uint64]*tcpFramedFlow
 
-	pendingMu  sync.Mutex
-	pendingTCP map[uint64]chan openResult
-	pendingUDP map[uint64]chan openResult
+	pendingMu   sync.Mutex
+	pendingTCP  map[uint64]chan openResult
+	pendingUDP  map[uint64]chan openResult
+	pendingPing map[string]chan error
 
 	closeOnce sync.Once
 }
@@ -60,23 +62,27 @@ func dialTCPSession(ctx context.Context, cfg Config) (*tcpSessionClient, error) 
 	if err != nil {
 		return nil, err
 	}
+	debugf(cfg, "attempting TCP session dial: addr=%s sni=%s alpn=%v timeout=%s", cfg.TCPAddr(), tlsConf.ServerName, tlsConf.NextProtos, cfg.TCPTimeout)
 
-	dialer := &net.Dialer{Timeout: cfg.TCPTimeout}
-	conn, err := tls.DialWithDialer(dialer, "tcp", cfg.TCPAddr(), tlsConf)
+	dialCtx, cancelDial := context.WithTimeout(ctx, cfg.TCPTimeout)
+	defer cancelDial()
+
+	conn, err := dialTCPTLS(dialCtx, cfg, tlsConf)
 	if err != nil {
 		return nil, wrapErr("dial tcp session", err)
 	}
 
 	clientCtx, cancelClient := context.WithCancel(context.Background())
 	c := &tcpSessionClient{
-		cfg:        cfg,
-		conn:       conn,
-		reader:     bufio.NewReader(conn),
-		ctx:        clientCtx,
-		cancel:     cancelClient,
-		flows:      make(map[uint64]*tcpFramedFlow),
-		pendingTCP: make(map[uint64]chan openResult),
-		pendingUDP: make(map[uint64]chan openResult),
+		cfg:         cfg,
+		conn:        conn,
+		reader:      bufio.NewReader(conn),
+		ctx:         clientCtx,
+		cancel:      cancelClient,
+		flows:       make(map[uint64]*tcpFramedFlow),
+		pendingTCP:  make(map[uint64]chan openResult),
+		pendingUDP:  make(map[uint64]chan openResult),
+		pendingPing: make(map[string]chan error),
 	}
 
 	if err := c.auth(ctx); err != nil {
@@ -87,6 +93,72 @@ func dialTCPSession(ctx context.Context, cfg Config) (*tcpSessionClient, error) 
 
 	go c.readLoop()
 	return c, nil
+}
+
+func dialTCPTLS(ctx context.Context, cfg Config, tlsConf *tls.Config) (net.Conn, error) {
+	type dialTarget struct {
+		network string
+		addr    string
+	}
+
+	targets := make([]dialTarget, 0, 4)
+	appendTarget := func(network, addr string) {
+		if addr == "" {
+			return
+		}
+		targets = append(targets, dialTarget{network: network, addr: addr})
+	}
+
+	if cfg.ForceIPv4 {
+		host := cfg.GatewayHost
+		port := strconv.Itoa(cfg.GatewayTCP)
+
+		if ip := net.ParseIP(host); ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				appendTarget("tcp4", net.JoinHostPort(ip4.String(), port))
+			}
+		} else {
+			ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+			if err == nil {
+				for _, ip := range ips {
+					if ip4 := ip.To4(); ip4 != nil {
+						appendTarget("tcp4", net.JoinHostPort(ip4.String(), port))
+					}
+				}
+			} else {
+				debugf(cfg, "tcp ipv4 resolve failed for %s: %v", host, err)
+			}
+		}
+	}
+
+	appendTarget("tcp", cfg.TCPAddr())
+
+	dialer := &net.Dialer{}
+	var lastErr error
+	for _, target := range targets {
+		rawConn, err := dialer.DialContext(ctx, target.network, target.addr)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		tlsConn := tls.Client(rawConn, tlsConf)
+		if d, ok := ctx.Deadline(); ok {
+			_ = tlsConn.SetDeadline(d)
+		}
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = rawConn.Close()
+			lastErr = err
+			continue
+		}
+		_ = tlsConn.SetDeadline(time.Time{})
+		return tlsConn, nil
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("no dial targets available")
+	}
+	return nil, lastErr
 }
 
 func (c *tcpSessionClient) auth(ctx context.Context) error {
@@ -218,6 +290,8 @@ func (c *tcpSessionClient) readLoop() {
 		switch frame.Type {
 		case session.FramePING:
 			_ = c.writeFrame(session.FramePONG, frame.Payload)
+		case session.FramePONG:
+			_ = c.resolvePendingPing(frame.Payload)
 		case session.FrameOPENTCPOK:
 			okPayload, err := session.DecodeOpenOKPayload(frame.Payload)
 			if err != nil {
@@ -285,6 +359,14 @@ func (c *tcpSessionClient) closeWithError(err error) {
 			close(ch)
 			delete(c.pendingUDP, flowID)
 		}
+		for key, ch := range c.pendingPing {
+			select {
+			case ch <- err:
+			default:
+			}
+			close(ch)
+			delete(c.pendingPing, key)
+		}
 		c.pendingMu.Unlock()
 
 		c.flowMu.Lock()
@@ -299,6 +381,42 @@ func (c *tcpSessionClient) closeWithError(err error) {
 func (c *tcpSessionClient) close() error {
 	c.closeWithError(io.EOF)
 	return nil
+}
+
+func (c *tcpSessionClient) probeRTT(ctx context.Context) (time.Duration, error) {
+	probeCtx, cancel := expectTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+
+	token := make([]byte, 12)
+	if _, err := rand.Read(token); err != nil {
+		return 0, wrapErr("random ping token", err)
+	}
+	key := string(token)
+	waitCh := make(chan error, 1)
+
+	c.pendingMu.Lock()
+	c.pendingPing[key] = waitCh
+	c.pendingMu.Unlock()
+
+	start := time.Now()
+	if err := c.writeFrame(session.FramePING, token); err != nil {
+		c.unregisterPendingPing(key)
+		return 0, err
+	}
+
+	select {
+	case err, ok := <-waitCh:
+		if !ok {
+			return 0, io.EOF
+		}
+		if err != nil {
+			return 0, err
+		}
+		return time.Since(start), nil
+	case <-probeCtx.Done():
+		c.unregisterPendingPing(key)
+		return 0, probeCtx.Err()
+	}
 }
 
 func (c *tcpSessionClient) writeFrame(frameType uint64, payload []byte) error {
@@ -371,6 +489,35 @@ func (c *tcpSessionClient) unregisterPendingUDP(flowID uint64) {
 	if ch != nil {
 		close(ch)
 	}
+}
+
+func (c *tcpSessionClient) unregisterPendingPing(key string) {
+	c.pendingMu.Lock()
+	ch := c.pendingPing[key]
+	delete(c.pendingPing, key)
+	c.pendingMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+func (c *tcpSessionClient) resolvePendingPing(payload []byte) bool {
+	key := string(payload)
+	c.pendingMu.Lock()
+	ch := c.pendingPing[key]
+	if ch != nil {
+		delete(c.pendingPing, key)
+	}
+	c.pendingMu.Unlock()
+	if ch == nil {
+		return false
+	}
+	select {
+	case ch <- nil:
+	default:
+	}
+	close(ch)
+	return true
 }
 
 func (f *tcpFramedFlow) ID() uint64 {

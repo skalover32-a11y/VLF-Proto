@@ -18,15 +18,20 @@ import (
 )
 
 type Config struct {
-	GatewayHost string
-	GatewayUDP  int
-	GatewayTCP  int
-	RelayBase   string
+	GatewayHost     string
+	GatewayDialHost string
+	GatewayUDP      int
+	GatewayTCP      int
+	RelayBase       string
 
 	ClientID string
 	Secret   []byte
 	ProtoID  string
+	ProtoIDs []string
 	PinSPKI  string
+	// TLSServerName is used for SNI / certificate pinning context.
+	// If empty, GatewayHost is used.
+	TLSServerName string
 
 	MaxDgramPayload int
 	QUICTimeout     time.Duration
@@ -36,7 +41,13 @@ type Config struct {
 	DisableQUIC       bool
 	DisableTCPSession bool
 	AllowRelay        bool
+	ForceIPv4         bool
 	Debug             bool
+}
+
+var defaultProtoIDCompat = []string{
+	"vlf-runtime/0.1",
+	"vlf-session/0.1",
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -48,6 +59,8 @@ func LoadConfigFromEnv() (Config, error) {
 	}
 
 	protoID := envOr("VLF_PROTO_ID", "vlf-runtime/0.1")
+	protoCompat := splitCSVEnv("VLF_PROTO_ID_COMPAT")
+	protoIDs := buildProtoIDList(protoID, protoCompat)
 	pin := envOr("VLF_PIN_SPKI", "")
 
 	defaultPort := envOrInt("GATEWAY_PORT", 443)
@@ -68,20 +81,29 @@ func LoadConfigFromEnv() (Config, error) {
 	if gatewayHost == "" {
 		gatewayHost = "localhost"
 	}
+	gatewayDialHost := envAny([]string{"GATEWAY_DIAL_HOST", "GATEWAY_IP"}, gatewayHost)
+	tlsServerName := envOr("VLF_TLS_SERVER_NAME", gatewayHost)
 
 	gatewayUDP := envOrInt("GATEWAY_PORT_UDP", defaultPort)
 	gatewayTCP := envOrInt("GATEWAY_PORT_TCP", defaultPort)
-	relayBase := envOr("RELAY_BASE", fmt.Sprintf("http://%s:8080", gatewayHost))
+	relayHost := gatewayDialHost
+	if relayHost == "" {
+		relayHost = gatewayHost
+	}
+	relayBase := envOr("RELAY_BASE", "http://"+net.JoinHostPort(relayHost, "8080"))
 
 	cfg := Config{
-		GatewayHost: gatewayHost,
-		GatewayUDP:  gatewayUDP,
-		GatewayTCP:  gatewayTCP,
-		RelayBase:   relayBase,
-		ClientID:    clientID,
-		Secret:      secret,
-		ProtoID:     protoID,
-		PinSPKI:     pin,
+		GatewayHost:     gatewayHost,
+		GatewayDialHost: gatewayDialHost,
+		GatewayUDP:      gatewayUDP,
+		GatewayTCP:      gatewayTCP,
+		RelayBase:       relayBase,
+		ClientID:        clientID,
+		Secret:          secret,
+		ProtoID:         protoIDs[0],
+		ProtoIDs:        protoIDs,
+		PinSPKI:         pin,
+		TLSServerName:   tlsServerName,
 
 		MaxDgramPayload:   envOrInt("MAX_DGRAM_PAYLOAD", 1200),
 		QUICTimeout:       time.Duration(envOrInt("QUIC_CONNECT_TIMEOUT_MS", 1800)) * time.Millisecond,
@@ -90,6 +112,7 @@ func LoadConfigFromEnv() (Config, error) {
 		DisableQUIC:       envBool("VLF_DISABLE_QUIC", false),
 		DisableTCPSession: envBool("VLF_DISABLE_TCP_SESSION", false),
 		AllowRelay:        !envBool("VLF_DISABLE_RELAY_FALLBACK", false),
+		ForceIPv4:         envBool("VLF_FORCE_IPV4", false),
 		Debug:             envBool("VLF_DEBUG", false),
 	}
 
@@ -104,19 +127,40 @@ func LoadConfigFromEnv() (Config, error) {
 }
 
 func (c Config) QUICAddr() string {
-	return net.JoinHostPort(c.GatewayHost, strconv.Itoa(c.GatewayUDP))
+	host := c.GatewayDialHost
+	if host == "" {
+		host = c.GatewayHost
+	}
+	return net.JoinHostPort(host, strconv.Itoa(c.GatewayUDP))
 }
 
 func (c Config) TCPAddr() string {
-	return net.JoinHostPort(c.GatewayHost, strconv.Itoa(c.GatewayTCP))
+	host := c.GatewayDialHost
+	if host == "" {
+		host = c.GatewayHost
+	}
+	return net.JoinHostPort(host, strconv.Itoa(c.GatewayTCP))
 }
 
 func (c Config) TLSConfig() (*tls.Config, error) {
+	alpn := c.ProtoIDs
+	if len(alpn) == 0 {
+		alpn = buildProtoIDList(c.ProtoID, nil)
+	}
+
+	serverName := c.TLSServerName
+	if serverName == "" {
+		serverName = c.GatewayHost
+	}
+	if serverName == "" {
+		serverName = c.GatewayDialHost
+	}
+
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
-		ServerName:         c.GatewayHost,
+		ServerName:         serverName,
 		MinVersion:         tls.VersionTLS13,
-		NextProtos:         []string{c.ProtoID},
+		NextProtos:         alpn,
 	}
 
 	if strings.TrimSpace(c.PinSPKI) == "" {
@@ -186,18 +230,18 @@ func splitHostPort(addr string) (string, int, error) {
 
 func envOr(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
-		return v
+		return strings.TrimSpace(v)
 	}
-	return fallback
+	return strings.TrimSpace(fallback)
 }
 
 func envAny(names []string, fallback string) string {
 	for _, name := range names {
 		if v := os.Getenv(name); v != "" {
-			return v
+			return strings.TrimSpace(v)
 		}
 	}
-	return fallback
+	return strings.TrimSpace(fallback)
 }
 
 func envOrInt(name string, fallback int) int {
@@ -233,4 +277,51 @@ func constantTimeEqual(a, b []byte) bool {
 		out |= a[i] ^ b[i]
 	}
 	return out == 0
+}
+
+func splitCSVEnv(name string) []string {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
+}
+
+func buildProtoIDList(primary string, extra []string) []string {
+	out := make([]string, 0, 1+len(extra)+len(defaultProtoIDCompat))
+	seen := make(map[string]struct{}, 1+len(extra)+len(defaultProtoIDCompat))
+
+	appendOne := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+
+	appendOne(primary)
+	for _, v := range extra {
+		appendOne(v)
+	}
+	for _, v := range defaultProtoIDCompat {
+		appendOne(v)
+	}
+
+	if len(out) == 0 {
+		out = append(out, "vlf-runtime/0.1")
+	}
+	return out
 }

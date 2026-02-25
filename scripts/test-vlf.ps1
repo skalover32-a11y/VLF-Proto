@@ -104,7 +104,7 @@ function Invoke-DockerBuild {
   $cmd = @"
 apk add --no-cache git ca-certificates >/dev/null && \
 GOOS=windows GOARCH=amd64 go build -o scripts/out/session_smoke.exe ./scripts/session_smoke.go && \
-GOOS=windows GOARCH=amd64 go build -o scripts/out/relay_smoke.exe ./scripts/relay_smoke.go
+GOOS=windows GOARCH=amd64 go build -o scripts/out/relay_smoke.exe ./scripts/relay_smoke/main.go
 "@
   & docker run --rm -v "${RepoRoot}:/src" -w /src golang:1.24-alpine sh -lc $cmd
   if ($LASTEXITCODE -ne 0) {
@@ -143,7 +143,7 @@ try {
     VLF_CLIENT = $Client
     VLF_SECRET = $Secret
   }
-  Invoke-DockerSmoke -Name "relay_smoke" -NetworkName $Network -Env $relayEnv -GoFile "./scripts/relay_smoke.go"
+  Invoke-DockerSmoke -Name "relay_smoke" -NetworkName $Network -Env $relayEnv -GoFile "./scripts/relay_smoke/main.go"
 
   $sessionEnv = @{
     GATEWAY_HOST = $GatewayHost

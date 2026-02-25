@@ -2,6 +2,7 @@ package sessionclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,8 @@ const (
 	TransportTCPSession Transport = "tcp-session"
 	TransportRelay      Transport = "relay"
 )
+
+var ErrRTTProbeUnsupported = errors.New("rtt probe unsupported for current transport")
 
 type DialError struct {
 	QUICErr  error `json:"quic_err,omitempty"`
@@ -49,6 +52,7 @@ type Client struct {
 type clientInner interface {
 	openTCPFlow(ctx context.Context, flowID uint64, dstHost string, dstPort int) (TCPFlow, error)
 	openUDPFlow(ctx context.Context, flowID uint64, dstHost string, dstPort int) (UDPFlow, error)
+	probeRTT(ctx context.Context) (time.Duration, error)
 	close() error
 }
 
@@ -65,6 +69,24 @@ type UDPFlow interface {
 }
 
 func Dial(ctx context.Context, cfg Config) (*Client, error) {
+	debugf(
+		cfg,
+		"dial config: host=%s dial_host=%s tls_sni=%s quic_addr=%s tcp_addr=%s relay=%s proto_id=%s alpn=%v prefer_quic=%t disable_quic=%t disable_tcp=%t allow_relay=%t force_ipv4=%t",
+		cfg.GatewayHost,
+		cfg.GatewayDialHost,
+		cfg.TLSServerName,
+		cfg.QUICAddr(),
+		cfg.TCPAddr(),
+		cfg.RelayBase,
+		cfg.ProtoID,
+		cfg.ProtoIDs,
+		cfg.PreferQUIC,
+		cfg.DisableQUIC,
+		cfg.DisableTCPSession,
+		cfg.AllowRelay,
+		cfg.ForceIPv4,
+	)
+
 	var order []Transport
 	if cfg.PreferQUIC {
 		order = []Transport{TransportQUIC, TransportTCPSession, TransportRelay}
@@ -140,6 +162,13 @@ func (c *Client) Close() error {
 		return nil
 	}
 	return c.inner.close()
+}
+
+func (c *Client) ProbeRTT(ctx context.Context) (time.Duration, error) {
+	if c.inner == nil {
+		return 0, io.EOF
+	}
+	return c.inner.probeRTT(ctx)
 }
 
 func debugf(cfg Config, format string, args ...any) {

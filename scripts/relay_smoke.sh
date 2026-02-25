@@ -24,5 +24,5 @@ docker run --rm --network "$NET" \
   -e VLF_SECRET \
   -v "$ROOT":/src -w /src golang:1.24-alpine sh -c '
   apk add --no-cache git ca-certificates &&
-  go run ./scripts/relay_smoke.go
+  go run ./scripts/relay_smoke/main.go
 '
