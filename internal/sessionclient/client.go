@@ -49,10 +49,29 @@ type Client struct {
 	nextFlow  atomic.Uint64
 }
 
+type SessionLease struct {
+	SessionID      uint64
+	IssuedAt       time.Time
+	LastActivityAt time.Time
+	ExpiresAt      time.Time
+	TTL            time.Duration
+	UpKbps         uint32
+	DownKbps       uint32
+	MaxFlows       uint32
+	MaxUDPPPS      uint32
+}
+
+type SessionUnusableState struct {
+	Reason string
+	Since  time.Time
+}
+
 type clientInner interface {
 	openTCPFlow(ctx context.Context, flowID uint64, dstHost string, dstPort int) (TCPFlow, error)
 	openUDPFlow(ctx context.Context, flowID uint64, dstHost string, dstPort int) (UDPFlow, error)
 	probeRTT(ctx context.Context) (time.Duration, error)
+	leaseState() (SessionLease, bool)
+	unusableState() (SessionUnusableState, bool)
 	close() error
 }
 
@@ -169,6 +188,20 @@ func (c *Client) ProbeRTT(ctx context.Context) (time.Duration, error) {
 		return 0, io.EOF
 	}
 	return c.inner.probeRTT(ctx)
+}
+
+func (c *Client) SessionLease() (SessionLease, bool) {
+	if c.inner == nil {
+		return SessionLease{}, false
+	}
+	return c.inner.leaseState()
+}
+
+func (c *Client) SessionUnusableReason() (SessionUnusableState, bool) {
+	if c.inner == nil {
+		return SessionUnusableState{}, false
+	}
+	return c.inner.unusableState()
 }
 
 func debugf(cfg Config, format string, args ...any) {

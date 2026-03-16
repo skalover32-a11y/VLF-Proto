@@ -61,7 +61,18 @@ const (
 	capMaxNewFlowsPerSecond = 2
 	capActiveFlowsMargin    = 4
 
-	udpQUICBackoff = 30 * time.Second
+	udpQUICBackoff             = 30 * time.Second
+	managedClientProbeAge      = 12 * time.Second
+	managedClientMaxIdle       = 45 * time.Second
+	managedClientLeaseSkew     = 5 * time.Second
+	probeFailureSuppressWindow = 10 * time.Second
+	policyRecentActivityWindow = 10 * time.Second
+	modeSwitchCooldown         = 5 * time.Second
+	survivalEnterConfirmTicks  = 2
+	survivalExitStableTicks    = 5
+	survivalExitWeightedMax    = 1.0
+	fastEnterConfirmTicks      = 2
+	fastExitStableTicks        = 4
 )
 
 const (
@@ -93,8 +104,9 @@ type flowState struct {
 	client    *sessionclient.Client
 	clientKey string
 
-	upBytes   atomic.Int64
-	downBytes atomic.Int64
+	upBytes      atomic.Int64
+	downBytes    atomic.Int64
+	lastActivity atomic.Int64
 
 	mu          sync.Mutex
 	downSamples []downSample
@@ -106,9 +118,47 @@ type downSample struct {
 }
 
 type rttSample struct {
-	at time.Time
-	ms float64
+	at            time.Time
+	ms            float64
+	transport     sessionclient.Transport
+	clientKey     string
+	reason        policyCandidateReason
+	lowConfidence bool
 }
+
+type policyCandidateReason string
+
+const (
+	policyCandidateHealthy            policyCandidateReason = "healthy"
+	policyCandidateLeaseExpiring      policyCandidateReason = "lease_expiring"
+	policyCandidateLeaseExpired       policyCandidateReason = "lease_expired"
+	policyCandidateControlLoopDead    policyCandidateReason = "control_loop_dead"
+	policyCandidateSessionClosed      policyCandidateReason = "session_closed"
+	policyCandidateProbeSuppressed    policyCandidateReason = "probe_suppressed"
+	policyCandidateClientMarkedBad    policyCandidateReason = "client_marked_bad"
+	policyCandidateTransportUnhealthy policyCandidateReason = "transport_unhealthy"
+	policyCandidateNoRecentActivity   policyCandidateReason = "no_recent_activity"
+	policyCandidateLowConfidence      policyCandidateReason = "low_confidence_sample"
+)
+
+type policyCandidate struct {
+	flowID         uint64
+	client         *sessionclient.Client
+	clientKey      string
+	transport      sessionclient.Transport
+	reason         policyCandidateReason
+	lowConfidence  bool
+	lastActivityAt time.Time
+}
+
+type failureClass string
+
+const (
+	failureClassHardFailure           failureClass = "hard_failure"
+	failureClassMeaningfulDegradation failureClass = "meaningful_degradation"
+	failureClassLowConfidence         failureClass = "low_confidence_failure"
+	failureClassIgnored               failureClass = "ignored_failure"
+)
 
 type capState struct {
 	Enabled           bool `json:"enabled"`
@@ -132,9 +182,10 @@ type statsPayload struct {
 }
 
 type flowWriter struct {
-	dst       io.Writer
-	flowBytes *atomic.Int64
-	total     *atomic.Int64
+	dst          io.Writer
+	flowBytes    *atomic.Int64
+	total        *atomic.Int64
+	lastActivity *atomic.Int64
 }
 
 func (w *flowWriter) Write(p []byte) (int, error) {
@@ -142,6 +193,9 @@ func (w *flowWriter) Write(p []byte) (int, error) {
 	if n > 0 {
 		w.flowBytes.Add(int64(n))
 		w.total.Add(int64(n))
+		if w.lastActivity != nil {
+			w.lastActivity.Store(time.Now().UnixNano())
+		}
 	}
 	return n, err
 }
@@ -153,17 +207,25 @@ type policyController struct {
 	statsFormat statsFormat
 	closeOnce   sync.Once
 
-	mu            sync.Mutex
-	nextFlowID    uint64
-	flows         map[uint64]*flowState
-	clients       map[string]*managedClient
-	lastTransport sessionclient.Transport
-	switches      uint64
+	mu                   sync.Mutex
+	nextFlowID           uint64
+	flows                map[uint64]*flowState
+	clients              map[string]*managedClient
+	lastTransport        sessionclient.Transport
+	switches             uint64
+	lastModeSwitchAt     time.Time
+	lastModeSwitchReason string
+	degradedTicks        int
+	stableTicks          int
+	fastSignalTicks      int
+	fastQuietTicks       int
 
-	quicFailTimes  []time.Time
-	errorSpikeTime []time.Time
-	survivalSince  time.Time
-	survivalUntil  time.Time
+	quicFailTimes              []time.Time
+	quicLowConfidenceFailTimes []time.Time
+	errorSpikeTime             []time.Time
+	errorLowConfidenceTimes    []time.Time
+	survivalSince              time.Time
+	survivalUntil              time.Time
 
 	rttSamples []rttSample
 
@@ -194,7 +256,19 @@ type managedClient struct {
 	refCount  int
 	broken    bool
 	lastUsed  time.Time
+
+	unusableReason string
+	unusableSince  time.Time
+	unusableUntil  time.Time
 }
+
+type managedClientLeaseDecision uint8
+
+const (
+	managedClientLeaseReuse managedClientLeaseDecision = iota
+	managedClientLeaseExpiring
+	managedClientLeaseExpired
+)
 
 type tunReadWriter struct {
 	dev    tun.Device
@@ -940,7 +1014,7 @@ func handleTCPFromTun(local net.Conn, controller *policyController, connectTimeo
 			controller.releaseFlowPermit()
 			permitHeld = false
 		}
-		controller.onTransportError("open_tcp_flow_failed")
+		controller.onTransportError("open_tcp_flow_failed", client, clientKey, time.Now())
 		controller.markClientBad(clientKey, err)
 		controller.releaseClient(clientKey)
 		log.Printf("open tcp flow failed mode=%s for %s:%d -> %s:%d: %v", mode, srcIP, srcPort, dstIP, dstPort, err)
@@ -1155,7 +1229,7 @@ func (m *udpManager) runState(st *udpFlowState) {
 			m.controller.releaseFlowPermit()
 			permitHeld = false
 		}
-		m.controller.onTransportError("open_udp_flow_failed")
+		m.controller.onTransportError("open_udp_flow_failed", client, clientKey, time.Now())
 		m.noteQUICDialError(err)
 		m.controller.markClientBad(clientKey, err)
 		m.controller.releaseClient(clientKey)
@@ -1185,7 +1259,7 @@ func (m *udpManager) runState(st *udpFlowState) {
 
 	err = <-errCh
 	if !isExpectedUDPErr(err) {
-		m.controller.onTransportError("udp_pump_error")
+		m.controller.onTransportError("udp_pump_error", st.client, st.clientKey, udpStateLastActivityAt(st, time.Now()))
 		m.controller.markClientBad(st.clientKey, err)
 		log.Printf("udp pump ended with error key=%s: %v", st.key, err)
 	}
@@ -1213,6 +1287,7 @@ func (m *udpManager) localToRemote(st *udpFlowState) error {
 			if st.flowRef != nil {
 				st.flowRef.upBytes.Add(int64(n))
 				m.controller.totalUpBytes.Add(int64(n))
+				st.flowRef.lastActivity.Store(time.Now().UnixNano())
 			}
 			st.lastActive.Store(time.Now().UnixNano())
 		}
@@ -1269,6 +1344,7 @@ func (m *udpManager) remoteToLocal(st *udpFlowState) error {
 		if st.flowRef != nil {
 			st.flowRef.downBytes.Add(int64(len(payload)))
 			m.controller.totalDownBytes.Add(int64(len(payload)))
+			st.flowRef.lastActivity.Store(time.Now().UnixNano())
 		}
 		st.lastActive.Store(time.Now().UnixNano())
 	}
@@ -1421,7 +1497,7 @@ func (m *udpManager) dnsQueryOverTCP(ctx context.Context, query []byte) ([]byte,
 			m.controller.releaseFlowPermit()
 			permitHeld = false
 		}
-		m.controller.onTransportError("dns_open_tcp_failed")
+		m.controller.onTransportError("dns_open_tcp_failed", client, clientKey, time.Now())
 		m.controller.markClientBad(clientKey, err)
 		m.controller.releaseClient(clientKey)
 		return nil, err
@@ -1437,16 +1513,17 @@ func (m *udpManager) dnsQueryOverTCP(ctx context.Context, query []byte) ([]byte,
 	copy(frame[2:], query)
 
 	if err := writeWithTimeout(ctx, flow, frame, m.connectTimeout); err != nil {
-		m.controller.onTransportError("dns_tcp_write")
+		m.controller.onTransportError("dns_tcp_write", client, clientKey, flowLastActivityAt(fs, time.Now()))
 		m.controller.markClientBad(clientKey, err)
 		return nil, err
 	}
 	fs.upBytes.Add(int64(len(query)))
 	m.controller.totalUpBytes.Add(int64(len(query)))
+	fs.lastActivity.Store(time.Now().UnixNano())
 
 	headerRaw, err := readNWithTimeout(ctx, flow, 2, m.connectTimeout)
 	if err != nil {
-		m.controller.onTransportError("dns_tcp_read_len")
+		m.controller.onTransportError("dns_tcp_read_len", client, clientKey, flowLastActivityAt(fs, time.Now()))
 		m.controller.markClientBad(clientKey, err)
 		return nil, err
 	}
@@ -1456,12 +1533,13 @@ func (m *udpManager) dnsQueryOverTCP(ctx context.Context, query []byte) ([]byte,
 	}
 	resp, err := readNWithTimeout(ctx, flow, respLen, m.connectTimeout)
 	if err != nil {
-		m.controller.onTransportError("dns_tcp_read_payload")
+		m.controller.onTransportError("dns_tcp_read_payload", client, clientKey, flowLastActivityAt(fs, time.Now()))
 		m.controller.markClientBad(clientKey, err)
 		return nil, err
 	}
 	fs.downBytes.Add(int64(len(resp)))
 	m.controller.totalDownBytes.Add(int64(len(resp)))
+	fs.lastActivity.Store(time.Now().UnixNano())
 	return resp, nil
 }
 
@@ -1595,6 +1673,7 @@ func (c *policyController) loop() {
 		case <-c.stopCh:
 			return
 		case now := <-ticker.C:
+			c.reapIdleClients(now)
 			c.probeRTT(now)
 			c.evaluateAutoPolicy(now)
 			c.printStats(now)
@@ -1624,15 +1703,73 @@ func (c *policyController) acquireClient(ctx context.Context, cfg sessionclient.
 
 	c.mu.Lock()
 	if mc := c.clients[key]; mc != nil && mc.client != nil && !mc.broken {
-		mc.refCount++
-		mc.lastUsed = now
+		if reason := c.currentManagedClientUnusableReasonLocked(mc, now); reason != "" && mc.refCount == 0 {
+			delete(c.clients, key)
+			client := mc.client
+			c.mu.Unlock()
+			_ = client.Close()
+			goto dialNew
+		}
+
+		if mc.refCount == 0 {
+			if lease, ok := mc.client.SessionLease(); ok {
+				switch classifyManagedClientLease(now, lease) {
+				case managedClientLeaseExpired:
+					delete(c.clients, key)
+					client := mc.client
+					transport := mc.transport
+					c.mu.Unlock()
+					log.Printf("auth_lease_expired: key=%s transport=%s session_id=%d expired_for=%s", key, transport, lease.SessionID, now.Sub(lease.ExpiresAt).Round(time.Second))
+					log.Printf("cached_client_rejected_due_to_lease: key=%s transport=%s session_id=%d", key, transport, lease.SessionID)
+					_ = client.Close()
+					goto dialNew
+				case managedClientLeaseExpiring:
+					delete(c.clients, key)
+					client := mc.client
+					transport := mc.transport
+					c.mu.Unlock()
+					log.Printf("auth_lease_expiring: key=%s transport=%s session_id=%d expires_in=%s", key, transport, lease.SessionID, lease.ExpiresAt.Sub(now).Round(time.Second))
+					log.Printf("proactive_reconnect_due_to_lease: key=%s transport=%s session_id=%d", key, transport, lease.SessionID)
+					_ = client.Close()
+					goto dialNew
+				}
+			}
+		}
+
+		if !shouldProbeManagedClient(now, mc.lastUsed, mc.refCount) {
+			mc.refCount++
+			mc.lastUsed = now
+			client := mc.client
+			transport := mc.transport
+			c.mu.Unlock()
+			return client, transport, key, false, nil
+		}
+
 		client := mc.client
 		transport := mc.transport
+		idleFor := now.Sub(mc.lastUsed)
 		c.mu.Unlock()
-		return client, transport, key, false, nil
+
+		probeCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+		_, err := client.ProbeRTT(probeCtx)
+		cancel()
+		if err == nil || errors.Is(err, sessionclient.ErrRTTProbeUnsupported) {
+			c.mu.Lock()
+			if current := c.clients[key]; current != nil && current.client == client && !current.broken {
+				current.refCount++
+				current.lastUsed = now
+				c.mu.Unlock()
+				return client, transport, key, false, nil
+			}
+			c.mu.Unlock()
+		} else {
+			log.Printf("policy cached client probe failed: key=%s transport=%s idle=%s err=%v", key, transport, idleFor.Round(time.Second), err)
+			c.markClientBad(key, err)
+		}
 	}
 	c.mu.Unlock()
 
+dialNew:
 	client, err := sessionclient.Dial(ctx, cfg)
 	if err != nil {
 		return nil, "", key, false, err
@@ -1660,6 +1797,44 @@ func (c *policyController) acquireClient(ctx context.Context, cfg sessionclient.
 	c.mu.Unlock()
 
 	return client, transport, key, true, nil
+}
+
+func (c *policyController) reapIdleClients(now time.Time) {
+	var toClose []*sessionclient.Client
+
+	c.mu.Lock()
+	for key, mc := range c.clients {
+		leaseExpired := false
+		if mc != nil && mc.client != nil {
+			if lease, ok := mc.client.SessionLease(); ok && classifyManagedClientLease(now, lease) == managedClientLeaseExpired {
+				leaseExpired = true
+			}
+		}
+		if !leaseExpired && !shouldReapManagedClient(now, mc) {
+			continue
+		}
+		reason := "idle"
+		if mc.broken {
+			reason = "broken"
+		} else if leaseExpired {
+			reason = "lease_expired"
+		}
+		idleFor := "n/a"
+		if !mc.lastUsed.IsZero() {
+			idleFor = now.Sub(mc.lastUsed).Round(time.Second).String()
+		}
+		log.Printf("policy cached client reaped: key=%s transport=%s reason=%s idle=%s refcount=%d",
+			key, mc.transport, reason, idleFor, mc.refCount)
+		if mc.client != nil {
+			toClose = append(toClose, mc.client)
+		}
+		delete(c.clients, key)
+	}
+	c.mu.Unlock()
+
+	for _, client := range toClose {
+		_ = client.Close()
+	}
 }
 
 func (c *policyController) releaseClient(key string) {
@@ -1706,6 +1881,7 @@ func (c *policyController) markClientBad(key string, err error) {
 	}
 
 	mc.broken = true
+	c.setManagedClientUnusableReasonLocked(mc, time.Now(), "client_marked_bad", 0)
 	if mc.refCount == 0 {
 		closeClient = mc.client
 		delete(c.clients, key)
@@ -1715,6 +1891,72 @@ func (c *policyController) markClientBad(key string, err error) {
 	if closeClient != nil {
 		_ = closeClient.Close()
 	}
+}
+
+func (c *policyController) setManagedClientUnusableReasonLocked(mc *managedClient, now time.Time, reason string, ttl time.Duration) {
+	if mc == nil || reason == "" {
+		return
+	}
+
+	until := time.Time{}
+	if ttl > 0 {
+		until = now.Add(ttl)
+	}
+	if mc.unusableReason == reason && mc.unusableUntil.Equal(until) {
+		return
+	}
+
+	mc.unusableReason = reason
+	mc.unusableSince = now
+	mc.unusableUntil = until
+
+	ttlText := "persistent"
+	if !until.IsZero() {
+		ttlText = ttl.Round(time.Millisecond).String()
+	}
+	log.Printf("session_unusable_reason_set: key=%s transport=%s reason=%s ttl=%s refcount=%d", mc.key, mc.transport, reason, ttlText, mc.refCount)
+}
+
+func (c *policyController) clearManagedClientTransientReasonLocked(mc *managedClient, reason string) {
+	if mc == nil || mc.unusableReason != reason || mc.unusableUntil.IsZero() {
+		return
+	}
+	mc.unusableReason = ""
+	mc.unusableSince = time.Time{}
+	mc.unusableUntil = time.Time{}
+}
+
+func (c *policyController) currentManagedClientUnusableReasonLocked(mc *managedClient, now time.Time) string {
+	if mc == nil {
+		return ""
+	}
+
+	if mc.broken {
+		if mc.unusableReason != "client_marked_bad" || !mc.unusableUntil.IsZero() {
+			c.setManagedClientUnusableReasonLocked(mc, now, "client_marked_bad", 0)
+		}
+		return "client_marked_bad"
+	}
+
+	if mc.client != nil {
+		if state, ok := mc.client.SessionUnusableReason(); ok && state.Reason != "" {
+			if mc.unusableReason != state.Reason || !mc.unusableUntil.IsZero() || !mc.unusableSince.Equal(state.Since) {
+				mc.unusableReason = state.Reason
+				mc.unusableSince = state.Since
+				mc.unusableUntil = time.Time{}
+				log.Printf("session_unusable_reason_set: key=%s transport=%s reason=%s ttl=persistent refcount=%d", mc.key, mc.transport, state.Reason, mc.refCount)
+			}
+			return state.Reason
+		}
+	}
+
+	if mc.unusableReason != "" && !mc.unusableUntil.IsZero() && !now.Before(mc.unusableUntil) {
+		mc.unusableReason = ""
+		mc.unusableSince = time.Time{}
+		mc.unusableUntil = time.Time{}
+	}
+
+	return mc.unusableReason
 }
 
 func (c *policyController) configForMode(mode clientMode) sessionclient.Config {
@@ -1734,25 +1976,55 @@ func (c *policyController) configForMode(mode clientMode) sessionclient.Config {
 	return cfg
 }
 
+func flowLastActivityAt(flow *flowState, fallback time.Time) time.Time {
+	if flow == nil {
+		return fallback
+	}
+	if ts := flow.lastActivity.Load(); ts > 0 {
+		return time.Unix(0, ts)
+	}
+	if !flow.startedAt.IsZero() {
+		return flow.startedAt
+	}
+	return fallback
+}
+
+func udpStateLastActivityAt(st *udpFlowState, fallback time.Time) time.Time {
+	if st == nil {
+		return fallback
+	}
+	if st.flowRef != nil {
+		return flowLastActivityAt(st.flowRef, fallback)
+	}
+	if ts := st.lastActive.Load(); ts > 0 {
+		return time.Unix(0, ts)
+	}
+	return fallback
+}
+
 func (c *policyController) onDialSuccess(mode clientMode, cfg sessionclient.Config, transport sessionclient.Transport) {
 	if mode == modeSurvival {
 		return
 	}
 	if !cfg.DisableQUIC && cfg.PreferQUIC && transport != sessionclient.TransportQUIC {
-		c.recordQUICFailure("dial_fallback_transport_" + string(transport))
+		c.recordQUICFailure("dial_fallback_transport_"+string(transport), failureClassMeaningfulDegradation, policyCandidateHealthy)
 	}
 }
 
 func (c *policyController) onDialError(cfg sessionclient.Config, err error) {
 	var de *sessionclient.DialError
 	if errors.As(err, &de) && de.QUICErr != nil && !cfg.DisableQUIC {
-		c.recordQUICFailure("dial_error")
+		c.recordQUICFailure("dial_error", failureClassMeaningfulDegradation, policyCandidateHealthy)
 	}
-	c.recordTransportError("dial_error")
+	c.recordTransportError("dial_error", failureClassMeaningfulDegradation, policyCandidateHealthy)
 }
 
-func (c *policyController) onTransportError(reason string) {
-	c.recordTransportError(reason)
+func (c *policyController) onTransportError(reason string, client *sessionclient.Client, clientKey string, lastActivityAt time.Time) {
+	now := time.Now()
+	c.mu.Lock()
+	candidateReason := c.classifyPolicySampleReasonLocked(now, client, clientKey, lastActivityAt)
+	c.mu.Unlock()
+	c.recordTransportError(reason, classifyFailureClass(reason, candidateReason), candidateReason)
 }
 
 func (c *policyController) registerFlow(client *sessionclient.Client, clientKey string, transport sessionclient.Transport, setupDuration time.Duration) *flowState {
@@ -1772,7 +2044,11 @@ func (c *policyController) registerFlow(client *sessionclient.Client, clientKey 
 		client:    client,
 		clientKey: clientKey,
 	}
+	fs.lastActivity.Store(now.UnixNano())
 	c.flows[fs.id] = fs
+	if mc := c.clients[clientKey]; mc != nil && mc.client == client {
+		c.clearManagedClientTransientReasonLocked(mc, "probe_failed")
+	}
 
 	if c.lastTransport == "" {
 		c.lastTransport = transport
@@ -1785,7 +2061,8 @@ func (c *policyController) registerFlow(client *sessionclient.Client, clientKey 
 	}
 
 	if setupDuration > 0 {
-		c.appendRTTSampleLocked(now, float64(setupDuration.Microseconds())/1000.0)
+		reason := c.classifyPolicySampleReasonLocked(now, client, clientKey, now)
+		c.appendRTTSampleLocked(now, float64(setupDuration.Microseconds())/1000.0, transport, clientKey, reason)
 	}
 
 	return fs
@@ -1842,40 +2119,74 @@ func (c *policyController) releaseFlowPermit() {
 	c.mu.Unlock()
 }
 
-func (c *policyController) recordQUICFailure(reason string) {
+func (c *policyController) recordQUICFailure(reason string, class failureClass, candidateReason policyCandidateReason) {
 	now := time.Now()
 	c.mu.Lock()
-	c.quicFailTimes = append(c.quicFailTimes, now)
 	c.quicFailTimes = pruneTimes(c.quicFailTimes, now.Add(-failureWindowDuration))
-	count := len(c.quicFailTimes)
-	configured := c.configured
-	current := c.currentMode
+	c.quicLowConfidenceFailTimes = pruneTimes(c.quicLowConfidenceFailTimes, now.Add(-failureWindowDuration))
+	switch class {
+	case failureClassHardFailure, failureClassMeaningfulDegradation:
+		c.quicFailTimes = append(c.quicFailTimes, now)
+	case failureClassLowConfidence:
+		c.quicLowConfidenceFailTimes = append(c.quicLowConfidenceFailTimes, now)
+	}
+	fullCount := len(c.quicFailTimes)
+	lowCount := len(c.quicLowConfidenceFailTimes)
+	weightedCount := weightedFailureCount(fullCount, lowCount)
 	c.mu.Unlock()
 
-	log.Printf("policy quic failure: reason=%s count_30s=%d", reason, count)
-	if configured == modeAuto && current != modeSurvival && count >= quicFailureThreshold {
-		c.switchMode(modeSurvival, fmt.Sprintf("quic_failures_%d_in_%s", count, failureWindowDuration))
+	log.Printf("failure_classified: scope=quic reason=%s failure_class=%s policy_candidate_reason=%s full_count_30s=%d low_confidence_count_30s=%d weighted_count_30s=%.1f",
+		reason, class, candidateReason, fullCount, lowCount, weightedCount)
+	switch class {
+	case failureClassIgnored:
+		log.Printf("failure_ignored_due_to_reason: scope=quic reason=%s policy_candidate_reason=%s", reason, candidateReason)
+		log.Printf("survival_input_ignored: scope=quic reason=%s policy_candidate_reason=%s", reason, candidateReason)
+		return
+	case failureClassLowConfidence:
+		log.Printf("failure_weight_reduced: scope=quic reason=%s policy_candidate_reason=%s", reason, candidateReason)
+		log.Printf("survival_input_reduced_confidence: scope=quic reason=%s policy_candidate_reason=%s weighted_count_30s=%.1f", reason, candidateReason, weightedCount)
+	default:
+		log.Printf("survival_input_accepted: scope=quic reason=%s policy_candidate_reason=%s weighted_count_30s=%.1f", reason, candidateReason, weightedCount)
 	}
+
+	log.Printf("policy quic failure: reason=%s full_count_30s=%d low_confidence_count_30s=%d weighted_count_30s=%.1f", reason, fullCount, lowCount, weightedCount)
 }
 
-func (c *policyController) recordTransportError(reason string) {
+func (c *policyController) recordTransportError(reason string, class failureClass, candidateReason policyCandidateReason) {
 	now := time.Now()
 	c.mu.Lock()
-	c.errorSpikeTime = append(c.errorSpikeTime, now)
 	c.errorSpikeTime = pruneTimes(c.errorSpikeTime, now.Add(-failureWindowDuration))
-	count := len(c.errorSpikeTime)
-	configured := c.configured
-	current := c.currentMode
+	c.errorLowConfidenceTimes = pruneTimes(c.errorLowConfidenceTimes, now.Add(-failureWindowDuration))
+	switch class {
+	case failureClassHardFailure, failureClassMeaningfulDegradation:
+		c.errorSpikeTime = append(c.errorSpikeTime, now)
+	case failureClassLowConfidence:
+		c.errorLowConfidenceTimes = append(c.errorLowConfidenceTimes, now)
+	}
+	fullCount := len(c.errorSpikeTime)
+	lowCount := len(c.errorLowConfidenceTimes)
+	weightedCount := weightedFailureCount(fullCount, lowCount)
 	c.mu.Unlock()
 
-	log.Printf("policy transport error: reason=%s count_30s=%d", reason, count)
-	if configured == modeAuto && current != modeSurvival && count >= transportErrorThreshold {
-		c.switchMode(modeSurvival, fmt.Sprintf("transport_errors_%d_in_%s", count, failureWindowDuration))
+	log.Printf("failure_classified: scope=transport reason=%s failure_class=%s policy_candidate_reason=%s full_count_30s=%d low_confidence_count_30s=%d weighted_count_30s=%.1f",
+		reason, class, candidateReason, fullCount, lowCount, weightedCount)
+	switch class {
+	case failureClassIgnored:
+		log.Printf("failure_ignored_due_to_reason: scope=transport reason=%s policy_candidate_reason=%s", reason, candidateReason)
+		log.Printf("survival_input_ignored: scope=transport reason=%s policy_candidate_reason=%s", reason, candidateReason)
+		return
+	case failureClassLowConfidence:
+		log.Printf("failure_weight_reduced: scope=transport reason=%s policy_candidate_reason=%s", reason, candidateReason)
+		log.Printf("survival_input_reduced_confidence: scope=transport reason=%s policy_candidate_reason=%s weighted_count_30s=%.1f", reason, candidateReason, weightedCount)
+	default:
+		log.Printf("survival_input_accepted: scope=transport reason=%s policy_candidate_reason=%s weighted_count_30s=%.1f", reason, candidateReason, weightedCount)
 	}
+
+	log.Printf("policy transport error: reason=%s full_count_30s=%d low_confidence_count_30s=%d weighted_count_30s=%.1f", reason, fullCount, lowCount, weightedCount)
 }
 
 func (c *policyController) probeRTT(now time.Time) {
-	client, transport, ok := c.pickProbeClient()
+	client, transport, clientKey, ok := c.pickProbeClient(now)
 	if !ok {
 		return
 	}
@@ -1889,53 +2200,294 @@ func (c *policyController) probeRTT(now time.Time) {
 			return
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			c.recordTransportError("rtt_probe_timeout_" + string(transport))
-			return
+			c.onTransportError("rtt_probe_timeout_"+string(transport), client, clientKey, now)
+		} else {
+			c.onTransportError("rtt_probe_error_"+string(transport), client, clientKey, now)
 		}
-		c.recordTransportError("rtt_probe_error_" + string(transport))
+		c.mu.Lock()
+		if mc := c.clients[clientKey]; mc != nil && mc.client == client {
+			c.setManagedClientUnusableReasonLocked(mc, time.Now(), "probe_failed", probeFailureSuppressWindow)
+		}
+		c.mu.Unlock()
 		return
 	}
 
 	c.mu.Lock()
-	c.appendRTTSampleLocked(now, float64(rtt.Microseconds())/1000.0)
+	if mc := c.clients[clientKey]; mc != nil && mc.client == client {
+		c.clearManagedClientTransientReasonLocked(mc, "probe_failed")
+	}
+	reason := c.classifyPolicySampleReasonLocked(now, client, clientKey, now)
+	c.appendRTTSampleLocked(now, float64(rtt.Microseconds())/1000.0, transport, clientKey, reason)
 	c.mu.Unlock()
 }
 
-func (c *policyController) pickProbeClient() (*sessionclient.Client, sessionclient.Transport, bool) {
+func (c *policyController) pickProbeClient(now time.Time) (*sessionclient.Client, sessionclient.Transport, string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if len(c.flows) == 0 {
-		return nil, "", false
+		return nil, "", "", false
 	}
-	var fallback *flowState
+
+	type probeCandidate struct {
+		client    *sessionclient.Client
+		transport sessionclient.Transport
+		key       string
+	}
+
+	seen := make(map[string]struct{}, len(c.flows))
+	var fallback *probeCandidate
 	for _, flow := range c.flows {
 		if flow.client == nil {
 			continue
 		}
+
+		key := flow.clientKey
+		if key == "" {
+			key = fmt.Sprintf("ptr:%p", flow.client)
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		var leaseDecision managedClientLeaseDecision
+		var lease sessionclient.SessionLease
+		var hasLease bool
+		var unusableReason string
+
+		if mc := c.clients[flow.clientKey]; mc != nil && mc.client == flow.client {
+			unusableReason = c.currentManagedClientUnusableReasonLocked(mc, now)
+			lease, hasLease = mc.client.SessionLease()
+		} else {
+			if state, ok := flow.client.SessionUnusableReason(); ok {
+				unusableReason = state.Reason
+			}
+			lease, hasLease = flow.client.SessionLease()
+		}
+
+		if hasLease {
+			leaseDecision = classifyManagedClientLease(now, lease)
+			if leaseDecision == managedClientLeaseExpired || leaseDecision == managedClientLeaseExpiring {
+				reason := "lease_expired"
+				expiresText := now.Sub(lease.ExpiresAt).Round(time.Second).String()
+				if leaseDecision == managedClientLeaseExpiring {
+					reason = "lease_expiring"
+					expiresText = lease.ExpiresAt.Sub(now).Round(time.Second).String()
+				}
+				log.Printf("probe_skipped_due_to_lease: key=%s transport=%s reason=%s session_id=%d expires=%s", key, flow.transport, reason, lease.SessionID, expiresText)
+				log.Printf("probe_client_rejected: key=%s transport=%s reason=%s", key, flow.transport, reason)
+				continue
+			}
+		}
+
+		if unusableReason != "" {
+			log.Printf("probe_skipped_due_to_unusable_reason: key=%s transport=%s reason=%s", key, flow.transport, unusableReason)
+			log.Printf("probe_client_rejected: key=%s transport=%s reason=%s", key, flow.transport, unusableReason)
+			continue
+		}
+
+		candidate := &probeCandidate{
+			client:    flow.client,
+			transport: flow.transport,
+			key:       key,
+		}
 		if fallback == nil {
-			fallback = flow
+			fallback = candidate
 		}
 		if c.lastTransport != "" && flow.transport == c.lastTransport {
-			return flow.client, flow.transport, true
+			log.Printf("probe_client_selected: key=%s transport=%s preferred=true", key, flow.transport)
+			return candidate.client, candidate.transport, candidate.key, true
 		}
 	}
 	if fallback == nil {
-		return nil, "", false
+		return nil, "", "", false
 	}
-	return fallback.client, fallback.transport, true
+	log.Printf("probe_client_selected: key=%s transport=%s preferred=false", fallback.key, fallback.transport)
+	return fallback.client, fallback.transport, fallback.key, true
+}
+
+func normalizePolicyCandidateReason(reason string) policyCandidateReason {
+	switch reason {
+	case "":
+		return policyCandidateHealthy
+	case "lease_expiring":
+		return policyCandidateLeaseExpiring
+	case "lease_expired":
+		return policyCandidateLeaseExpired
+	case "control_loop_dead":
+		return policyCandidateControlLoopDead
+	case "session_closed":
+		return policyCandidateSessionClosed
+	case "probe_failed":
+		return policyCandidateProbeSuppressed
+	case "client_marked_bad":
+		return policyCandidateClientMarkedBad
+	case "transport_unhealthy":
+		return policyCandidateTransportUnhealthy
+	case "no_recent_activity":
+		return policyCandidateNoRecentActivity
+	case "low_confidence_sample":
+		return policyCandidateLowConfidence
+	default:
+		return policyCandidateTransportUnhealthy
+	}
+}
+
+func classifyFailureClass(reason string, candidateReason policyCandidateReason) failureClass {
+	switch candidateReason {
+	case policyCandidateLeaseExpired,
+		policyCandidateControlLoopDead,
+		policyCandidateSessionClosed,
+		policyCandidateProbeSuppressed,
+		policyCandidateClientMarkedBad,
+		policyCandidateTransportUnhealthy:
+		return failureClassIgnored
+	case policyCandidateLeaseExpiring,
+		policyCandidateNoRecentActivity,
+		policyCandidateLowConfidence:
+		return failureClassLowConfidence
+	}
+
+	if strings.HasPrefix(reason, "rtt_probe_") || strings.HasPrefix(reason, "dial_") {
+		return failureClassMeaningfulDegradation
+	}
+	return failureClassHardFailure
+}
+
+func weightedFailureCount(fullCount, lowConfidenceCount int) float64 {
+	return float64(fullCount) + (float64(lowConfidenceCount) * 0.5)
+}
+
+func classifyPolicyCandidateReason(
+	now time.Time,
+	lastActivityAt time.Time,
+	hasLease bool,
+	leaseDecision managedClientLeaseDecision,
+	unusableReason string,
+) policyCandidateReason {
+	if unusableReason != "" {
+		return normalizePolicyCandidateReason(unusableReason)
+	}
+	if hasLease {
+		switch leaseDecision {
+		case managedClientLeaseExpired:
+			return policyCandidateLeaseExpired
+		case managedClientLeaseExpiring:
+			return policyCandidateLeaseExpiring
+		}
+	} else {
+		return policyCandidateLowConfidence
+	}
+	if !lastActivityAt.IsZero() && now.Sub(lastActivityAt) > policyRecentActivityWindow {
+		return policyCandidateNoRecentActivity
+	}
+	return policyCandidateHealthy
+}
+
+func (c *policyController) classifyPolicySampleReasonLocked(now time.Time, client *sessionclient.Client, clientKey string, lastActivityAt time.Time) policyCandidateReason {
+	if client == nil {
+		return policyCandidateLowConfidence
+	}
+
+	var leaseDecision managedClientLeaseDecision
+	var unusableReason string
+	var hasLease bool
+
+	if clientKey != "" {
+		if mc := c.clients[clientKey]; mc != nil && mc.client == client {
+			unusableReason = c.currentManagedClientUnusableReasonLocked(mc, now)
+			if lease, ok := mc.client.SessionLease(); ok {
+				hasLease = true
+				leaseDecision = classifyManagedClientLease(now, lease)
+			}
+			return classifyPolicyCandidateReason(now, lastActivityAt, hasLease, leaseDecision, unusableReason)
+		}
+	}
+
+	if state, ok := client.SessionUnusableReason(); ok && state.Reason != "" {
+		unusableReason = state.Reason
+	}
+	if lease, ok := client.SessionLease(); ok {
+		hasLease = true
+		leaseDecision = classifyManagedClientLease(now, lease)
+	}
+	return classifyPolicyCandidateReason(now, lastActivityAt, hasLease, leaseDecision, unusableReason)
+}
+
+func (c *policyController) evaluateFlowCandidateLocked(now time.Time, flow *flowState) policyCandidate {
+	if flow == nil {
+		return policyCandidate{reason: policyCandidateLowConfidence, lowConfidence: true}
+	}
+
+	lastActivityAt := flow.startedAt
+	if ts := flow.lastActivity.Load(); ts > 0 {
+		lastActivityAt = time.Unix(0, ts)
+	}
+	reason := c.classifyPolicySampleReasonLocked(now, flow.client, flow.clientKey, lastActivityAt)
+
+	return policyCandidate{
+		flowID:         flow.id,
+		client:         flow.client,
+		clientKey:      flow.clientKey,
+		transport:      flow.transport,
+		reason:         reason,
+		lowConfidence:  reason == policyCandidateLowConfidence,
+		lastActivityAt: lastActivityAt,
+	}
+}
+
+func selectPreferredPolicyCandidate(candidates []policyCandidate, lastTransport sessionclient.Transport) *policyCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	best := &candidates[0]
+	for i := 1; i < len(candidates); i++ {
+		candidate := &candidates[i]
+		bestPreferred := lastTransport != "" && best.transport == lastTransport
+		candidatePreferred := lastTransport != "" && candidate.transport == lastTransport
+		if candidatePreferred && !bestPreferred {
+			best = candidate
+			continue
+		}
+		if candidatePreferred == bestPreferred && candidate.lastActivityAt.After(best.lastActivityAt) {
+			best = candidate
+		}
+	}
+	return best
 }
 
 func (c *policyController) switchMode(next clientMode, reason string) {
-	now := time.Now()
+	c.switchModeAt(time.Now(), next, reason)
+}
+
+func (c *policyController) switchModeAt(now time.Time, next clientMode, reason string) bool {
 	c.mu.Lock()
 	prev := c.currentMode
 	if prev == next {
 		c.mu.Unlock()
-		return
+		return false
+	}
+	lastSwitchAt := c.lastModeSwitchAt
+	lastReason := c.lastModeSwitchReason
+	if !lastSwitchAt.IsZero() && now.Sub(lastSwitchAt) < modeSwitchCooldown {
+		remaining := (modeSwitchCooldown - now.Sub(lastSwitchAt)).Round(time.Millisecond)
+		c.mu.Unlock()
+		if lastReason == reason {
+			log.Printf("repeated_storm_suppressed: from=%s to=%s mode_switch_reason=%s cooldown_remaining=%s", prev, next, reason, remaining)
+		}
+		log.Printf("mode_switch_suppressed_by_cooldown: from=%s to=%s mode_switch_reason=%s cooldown_remaining=%s last_mode_switch_reason=%s", prev, next, reason, remaining, lastReason)
+		return false
 	}
 	c.currentMode = next
 	c.switches++
+	c.lastModeSwitchAt = now
+	c.lastModeSwitchReason = reason
+	c.degradedTicks = 0
+	c.stableTicks = 0
+	c.fastSignalTicks = 0
+	c.fastQuietTicks = 0
 	if next == modeSurvival {
 		c.survivalSince = now
 		c.survivalUntil = now.Add(survivalRecoveryMinDelay)
@@ -1943,7 +2495,106 @@ func (c *policyController) switchMode(next clientMode, reason string) {
 	switches := c.switches
 	c.mu.Unlock()
 
+	log.Printf("mode_switch_confirmed: from=%s to=%s mode_switch_reason=%s switches=%d", prev, next, reason, switches)
 	log.Printf("policy mode switch: from=%s to=%s reason=%s switches=%d", prev, next, reason, switches)
+	return true
+}
+
+func preferredSurvivalReason(weightedQuicFails, weightedTransportErrs float64) string {
+	quicRatio := weightedQuicFails / float64(quicFailureThreshold)
+	transportRatio := weightedTransportErrs / float64(transportErrorThreshold)
+	if transportRatio > quicRatio {
+		return fmt.Sprintf("transport_errors_weighted_%.1f_in_%s", weightedTransportErrs, failureWindowDuration)
+	}
+	return fmt.Sprintf("quic_failures_weighted_%.1f_in_%s", weightedQuicFails, failureWindowDuration)
+}
+
+func fastSignalReason(flow *flowState, now time.Time) (string, bool) {
+	if flow == nil {
+		return "", false
+	}
+	duration := now.Sub(flow.startedAt)
+	if duration >= fastFlowDurationThreshold {
+		return fmt.Sprintf("flow_%d_duration_%s", flow.id, duration.Round(time.Second)), true
+	}
+	downBytes := flow.downBytes.Load()
+	if downBytes >= fastDownloadThreshold {
+		return fmt.Sprintf("flow_%d_download_%dmb", flow.id, downBytes/(1024*1024)), true
+	}
+	if avgDownrateMbps(flow, now) >= fastDownrateThresholdMbps {
+		return fmt.Sprintf("flow_%d_downrate_gt_%.0fmbps_for_%s", flow.id, fastDownrateThresholdMbps, fastDownrateWindow), true
+	}
+	return "", false
+}
+
+func selectFastSignal(now time.Time, flows []*flowState, healthyCandidates []policyCandidate, lastTransport sessionclient.Transport) (*policyCandidate, string) {
+	fastEligible := make([]policyCandidate, 0, len(healthyCandidates))
+	fastEligibleReasons := make(map[uint64]string, len(healthyCandidates))
+	for _, candidate := range healthyCandidates {
+		f := findFlowByID(flows, candidate.flowID)
+		if f == nil {
+			continue
+		}
+		if reason, ok := fastSignalReason(f, now); ok {
+			fastEligible = append(fastEligible, candidate)
+			fastEligibleReasons[candidate.flowID] = reason
+		}
+	}
+	fastSelected := selectPreferredPolicyCandidate(fastEligible, lastTransport)
+	if fastSelected == nil {
+		return nil, ""
+	}
+	return fastSelected, fastEligibleReasons[fastSelected.flowID]
+}
+
+func (c *policyController) applyFastModeHysteresis(now time.Time, mode clientMode, fastSelected *policyCandidate, reason string) {
+	if mode == modeNormal {
+		if fastSelected == nil {
+			c.mu.Lock()
+			c.fastSignalTicks = 0
+			c.mu.Unlock()
+			return
+		}
+		c.mu.Lock()
+		c.fastSignalTicks++
+		c.fastQuietTicks = 0
+		fastSignalTicks := c.fastSignalTicks
+		c.mu.Unlock()
+		log.Printf("mode_hysteresis_enter_check: from=%s to=%s signal=fast mode_switch_reason=%s fast_signal_ticks=%d required_confirm_ticks=%d",
+			modeNormal, modeFast, reason, fastSignalTicks, fastEnterConfirmTicks)
+		if fastSignalTicks < fastEnterConfirmTicks {
+			log.Printf("mode_switch_suppressed_by_insufficient_signal: from=%s to=%s mode_switch_reason=%s fast_signal_ticks=%d required_confirm_ticks=%d",
+				modeNormal, modeFast, reason, fastSignalTicks, fastEnterConfirmTicks)
+			return
+		}
+		c.switchModeAt(now, modeFast, reason)
+		return
+	}
+
+	if mode != modeFast {
+		return
+	}
+
+	if fastSelected != nil {
+		c.mu.Lock()
+		c.fastQuietTicks = 0
+		c.fastSignalTicks = 0
+		c.mu.Unlock()
+		return
+	}
+
+	c.mu.Lock()
+	c.fastQuietTicks++
+	fastQuietTicks := c.fastQuietTicks
+	c.mu.Unlock()
+	log.Printf("mode_hysteresis_exit_check: from=%s to=%s stable=%t stable_ticks=%d required_stable_ticks=%d mode_switch_reason=%s",
+		modeFast, modeNormal, true, fastQuietTicks, fastExitStableTicks, "fast_recovery_quiet_window")
+	if fastQuietTicks < fastExitStableTicks {
+		log.Printf("mode_switch_suppressed_by_stability_window: from=%s to=%s mode_switch_reason=%s stable_ticks=%d required_stable_ticks=%d",
+			modeFast, modeNormal, "fast_recovery_quiet_window", fastQuietTicks, fastExitStableTicks)
+		return
+	}
+	c.switchModeAt(now, modeNormal, "fast_recovery_quiet_window")
 }
 
 func (c *policyController) evaluateAutoPolicy(now time.Time) {
@@ -1954,55 +2605,129 @@ func (c *policyController) evaluateAutoPolicy(now time.Time) {
 	}
 
 	c.quicFailTimes = pruneTimes(c.quicFailTimes, now.Add(-failureWindowDuration))
+	c.quicLowConfidenceFailTimes = pruneTimes(c.quicLowConfidenceFailTimes, now.Add(-failureWindowDuration))
 	c.errorSpikeTime = pruneTimes(c.errorSpikeTime, now.Add(-failureWindowDuration))
+	c.errorLowConfidenceTimes = pruneTimes(c.errorLowConfidenceTimes, now.Add(-failureWindowDuration))
 
 	mode := c.currentMode
 	quicFails := len(c.quicFailTimes)
+	quicLowConfidenceFails := len(c.quicLowConfidenceFailTimes)
 	transportErrs := len(c.errorSpikeTime)
+	transportLowConfidenceErrs := len(c.errorLowConfidenceTimes)
 	survivalUntil := c.survivalUntil
 	flows := make([]*flowState, 0, len(c.flows))
 	for _, f := range c.flows {
 		flows = append(flows, f)
 	}
+	lastTransport := c.lastTransport
+	healthyCandidates := make([]policyCandidate, 0, len(flows))
+	lowConfidenceCandidates := make([]policyCandidate, 0, len(flows))
+	rejectedCandidates := make([]policyCandidate, 0, len(flows))
+	for _, f := range flows {
+		candidate := c.evaluateFlowCandidateLocked(now, f)
+		switch candidate.reason {
+		case policyCandidateHealthy:
+			healthyCandidates = append(healthyCandidates, candidate)
+		case policyCandidateLowConfidence:
+			lowConfidenceCandidates = append(lowConfidenceCandidates, candidate)
+		default:
+			rejectedCandidates = append(rejectedCandidates, candidate)
+		}
+	}
+	degradedTicks := c.degradedTicks
+	stableTicks := c.stableTicks
+	fastSignalTicks := c.fastSignalTicks
+	fastQuietTicks := c.fastQuietTicks
 	c.mu.Unlock()
 
-	if mode != modeSurvival && quicFails >= quicFailureThreshold {
-		c.switchMode(modeSurvival, fmt.Sprintf("quic_failures_%d_in_%s", quicFails, failureWindowDuration))
-		return
+	weightedQuicFails := weightedFailureCount(quicFails, quicLowConfidenceFails)
+	weightedTransportErrs := weightedFailureCount(transportErrs, transportLowConfidenceErrs)
+	log.Printf("hysteresis_signal_snapshot: mode=%s quic_full=%d quic_low=%d quic_weighted=%.1f transport_full=%d transport_low=%d transport_weighted=%.1f active_flows=%d healthy_candidates=%d low_confidence_candidates=%d rejected_candidates=%d degraded_ticks=%d stable_ticks=%d fast_signal_ticks=%d fast_quiet_ticks=%d",
+		mode, quicFails, quicLowConfidenceFails, weightedQuicFails, transportErrs, transportLowConfidenceErrs, weightedTransportErrs, len(flows), len(healthyCandidates), len(lowConfidenceCandidates), len(rejectedCandidates), degradedTicks, stableTicks, fastSignalTicks, fastQuietTicks)
+
+	for _, candidate := range rejectedCandidates {
+		log.Printf("policy_candidate_rejected: flow_id=%d transport=%s policy_candidate_reason=%s", candidate.flowID, candidate.transport, candidate.reason)
 	}
-	if mode != modeSurvival && transportErrs >= transportErrorThreshold {
-		c.switchMode(modeSurvival, fmt.Sprintf("transport_errors_%d_in_%s", transportErrs, failureWindowDuration))
-		return
+	for _, candidate := range lowConfidenceCandidates {
+		log.Printf("policy_candidate_rejected: flow_id=%d transport=%s policy_candidate_reason=%s", candidate.flowID, candidate.transport, candidate.reason)
+		log.Printf("policy_sample_low_confidence: flow_id=%d transport=%s policy_candidate_reason=%s", candidate.flowID, candidate.transport, candidate.reason)
 	}
+
+	survivalSignal := weightedQuicFails >= float64(quicFailureThreshold) || weightedTransportErrs >= float64(transportErrorThreshold)
+	survivalReason := preferredSurvivalReason(weightedQuicFails, weightedTransportErrs)
 
 	if mode == modeSurvival {
-		if now.After(survivalUntil) && quicFails == 0 && transportErrs == 0 {
-			c.switchMode(modeNormal, "survival_recovery_no_recent_errors")
+		exitStable := now.After(survivalUntil) &&
+			quicFails == 0 &&
+			transportErrs == 0 &&
+			weightedQuicFails <= survivalExitWeightedMax &&
+			weightedTransportErrs <= survivalExitWeightedMax
+		c.mu.Lock()
+		if exitStable {
+			c.stableTicks++
+		} else {
+			c.stableTicks = 0
+		}
+		stableTicks = c.stableTicks
+		c.mu.Unlock()
+		log.Printf("mode_hysteresis_exit_check: from=%s to=%s stable=%t stable_ticks=%d required_stable_ticks=%d quic_weighted=%.1f transport_weighted=%.1f survival_until=%s",
+			modeSurvival, modeNormal, exitStable, stableTicks, survivalExitStableTicks, weightedQuicFails, weightedTransportErrs, survivalUntil.Format(time.RFC3339Nano))
+		if !exitStable {
+			return
+		}
+		if stableTicks < survivalExitStableTicks {
+			log.Printf("mode_switch_suppressed_by_stability_window: from=%s to=%s mode_switch_reason=%s stable_ticks=%d required_stable_ticks=%d",
+				modeSurvival, modeNormal, "survival_recovery_stable_window", stableTicks, survivalExitStableTicks)
+			return
+		}
+		c.switchModeAt(now, modeNormal, "survival_recovery_stable_window")
+		return
+	}
+
+	if survivalSignal {
+		c.mu.Lock()
+		c.degradedTicks++
+		degradedTicks = c.degradedTicks
+		c.mu.Unlock()
+		log.Printf("mode_hysteresis_enter_check: from=%s to=%s signal=degraded mode_switch_reason=%s quic_weighted=%.1f transport_weighted=%.1f degraded_ticks=%d required_confirm_ticks=%d",
+			mode, modeSurvival, survivalReason, weightedQuicFails, weightedTransportErrs, degradedTicks, survivalEnterConfirmTicks)
+		if degradedTicks < survivalEnterConfirmTicks {
+			log.Printf("mode_switch_suppressed_by_insufficient_signal: from=%s to=%s mode_switch_reason=%s degraded_ticks=%d required_confirm_ticks=%d",
+				mode, modeSurvival, survivalReason, degradedTicks, survivalEnterConfirmTicks)
+			return
+		}
+		c.switchModeAt(now, modeSurvival, survivalReason)
+		return
+	}
+	c.mu.Lock()
+	c.degradedTicks = 0
+	c.mu.Unlock()
+
+	selected := selectPreferredPolicyCandidate(healthyCandidates, lastTransport)
+	if selected == nil {
+		log.Printf("auto_policy_no_viable_candidate: mode=%s active_flows=%d low_confidence=%d", mode, len(flows), len(lowConfidenceCandidates))
+		if mode == modeFast {
+			c.mu.Lock()
+			c.fastQuietTicks++
+			fastQuietTicks = c.fastQuietTicks
+			c.mu.Unlock()
+			log.Printf("mode_hysteresis_exit_check: from=%s to=%s stable=%t stable_ticks=%d required_stable_ticks=%d mode_switch_reason=%s",
+				modeFast, modeNormal, true, fastQuietTicks, fastExitStableTicks, "fast_recovery_quiet_window")
+			if fastQuietTicks < fastExitStableTicks {
+				log.Printf("mode_switch_suppressed_by_stability_window: from=%s to=%s mode_switch_reason=%s stable_ticks=%d required_stable_ticks=%d",
+					modeFast, modeNormal, "fast_recovery_quiet_window", fastQuietTicks, fastExitStableTicks)
+				return
+			}
+			c.switchModeAt(now, modeNormal, "fast_recovery_quiet_window")
 		}
 		return
 	}
 
-	if mode != modeNormal {
-		return
-	}
+	log.Printf("policy_candidate_selected: flow_id=%d transport=%s policy_candidate_reason=%s", selected.flowID, selected.transport, selected.reason)
+	log.Printf("auto_policy_used_candidate: flow_id=%d transport=%s policy_candidate_reason=%s", selected.flowID, selected.transport, selected.reason)
 
-	for _, f := range flows {
-		duration := now.Sub(f.startedAt)
-		if duration >= fastFlowDurationThreshold {
-			c.switchMode(modeFast, fmt.Sprintf("flow_%d_duration_%s", f.id, duration.Round(time.Second)))
-			return
-		}
-
-		downBytes := f.downBytes.Load()
-		if downBytes >= fastDownloadThreshold {
-			c.switchMode(modeFast, fmt.Sprintf("flow_%d_download_%dmb", f.id, downBytes/(1024*1024)))
-			return
-		}
-		if avgDownrateMbps(f, now) >= fastDownrateThresholdMbps {
-			c.switchMode(modeFast, fmt.Sprintf("flow_%d_downrate_gt_%.0fmbps_for_%s", f.id, fastDownrateThresholdMbps, fastDownrateWindow))
-			return
-		}
-	}
+	fastSelected, fastReason := selectFastSignal(now, flows, healthyCandidates, lastTransport)
+	c.applyFastModeHysteresis(now, mode, fastSelected, fastReason)
 }
 
 func (c *policyController) printStats(now time.Time) {
@@ -2025,17 +2750,24 @@ func (c *policyController) printStats(now time.Time) {
 	switches := c.switches
 	sf := c.statsFormat
 
-	rttWindow := c.collectRTTWindowLocked(prevAt, now)
+	rttWindow, lowConfidenceWindow := c.collectRTTWindowLocked(prevAt, now)
 	var rttP50Ptr *float64
 	var rttP95Ptr *float64
+	var capRTTP95Ptr *float64
 	if len(rttWindow) > 0 {
 		p50 := percentile(rttWindow, 50)
 		p95 := percentile(rttWindow, 95)
 		rttP50Ptr = &p50
 		rttP95Ptr = &p95
+		capRTTP95Ptr = &p95
+	} else if len(lowConfidenceWindow) > 0 {
+		p50 := percentile(lowConfidenceWindow, 50)
+		p95 := percentile(lowConfidenceWindow, 95)
+		rttP50Ptr = &p50
+		rttP95Ptr = &p95
 	}
 
-	c.updateAdaptiveCapLocked(now, activeFlows, rttP95Ptr)
+	c.updateAdaptiveCapLocked(now, activeFlows, capRTTP95Ptr)
 	capSnapshot := c.capSnapshotLocked()
 
 	c.lastStatsAt = now
@@ -2103,11 +2835,18 @@ func (c *policyController) printStats(now time.Time) {
 		modeLabel, transportLabel, activeFlows, upTotal, downTotal, upMbps, downMbps, totalMbps, rttP50Label, rttP95Label, switches, capLabel)
 }
 
-func (c *policyController) appendRTTSampleLocked(at time.Time, ms float64) {
+func (c *policyController) appendRTTSampleLocked(at time.Time, ms float64, transport sessionclient.Transport, clientKey string, reason policyCandidateReason) {
 	if ms <= 0 {
 		return
 	}
-	c.rttSamples = append(c.rttSamples, rttSample{at: at, ms: ms})
+	c.rttSamples = append(c.rttSamples, rttSample{
+		at:            at,
+		ms:            ms,
+		transport:     transport,
+		clientKey:     clientKey,
+		reason:        reason,
+		lowConfidence: reason == policyCandidateLowConfidence,
+	})
 	c.pruneRTTSamplesLocked(at.Add(-2 * time.Minute))
 }
 
@@ -2126,16 +2865,25 @@ func (c *policyController) pruneRTTSamplesLocked(cutoff time.Time) {
 	c.rttSamples = c.rttSamples[:len(c.rttSamples)-idx]
 }
 
-func (c *policyController) collectRTTWindowLocked(from, now time.Time) []float64 {
+func (c *policyController) collectRTTWindowLocked(from, now time.Time) ([]float64, []float64) {
 	c.pruneRTTSamplesLocked(now.Add(-2 * time.Minute))
-	out := make([]float64, 0, len(c.rttSamples))
+	healthy := make([]float64, 0, len(c.rttSamples))
+	lowConfidence := make([]float64, 0, len(c.rttSamples))
 	for _, sample := range c.rttSamples {
 		if sample.at.Before(from) {
 			continue
 		}
-		out = append(out, sample.ms)
+		switch sample.reason {
+		case policyCandidateHealthy:
+			healthy = append(healthy, sample.ms)
+		case policyCandidateLowConfidence:
+			lowConfidence = append(lowConfidence, sample.ms)
+			log.Printf("policy_sample_low_confidence: transport=%s client_key=%s policy_candidate_reason=%s", sample.transport, sample.clientKey, sample.reason)
+		default:
+			log.Printf("auto_policy_ignored_sample_due_to_reason: transport=%s client_key=%s policy_candidate_reason=%s", sample.transport, sample.clientKey, sample.reason)
+		}
 	}
-	return out
+	return healthy, lowConfidence
 }
 
 func (c *policyController) updateAdaptiveCapLocked(now time.Time, activeFlows int, rttP95 *float64) {
@@ -2245,6 +2993,15 @@ func avgDownrateMbps(flow *flowState, now time.Time) float64 {
 	return bytesToMbps(delta, dt)
 }
 
+func findFlowByID(flows []*flowState, id uint64) *flowState {
+	for _, flow := range flows {
+		if flow != nil && flow.id == id {
+			return flow
+		}
+	}
+	return nil
+}
+
 func percentile(samples []float64, p float64) float64 {
 	if len(samples) == 0 {
 		return 0
@@ -2310,14 +3067,16 @@ func proxyBidirectional(local net.Conn, remote sessionclient.TCPFlow, controller
 	}
 
 	upWriter := &flowWriter{
-		dst:       remote,
-		flowBytes: &fs.upBytes,
-		total:     &controller.totalUpBytes,
+		dst:          remote,
+		flowBytes:    &fs.upBytes,
+		total:        &controller.totalUpBytes,
+		lastActivity: &fs.lastActivity,
 	}
 	downWriter := &flowWriter{
-		dst:       local,
-		flowBytes: &fs.downBytes,
-		total:     &controller.totalDownBytes,
+		dst:          local,
+		flowBytes:    &fs.downBytes,
+		total:        &controller.totalDownBytes,
+		lastActivity: &fs.lastActivity,
 	}
 
 	errCh := make(chan error, 2)
@@ -2335,12 +3094,12 @@ func proxyBidirectional(local net.Conn, remote sessionclient.TCPFlow, controller
 	second := <-errCh
 
 	if !isExpectedPipeErr(first) {
-		controller.onTransportError("proxy_copy_up")
+		controller.onTransportError("proxy_copy_up", fs.client, fs.clientKey, flowLastActivityAt(fs, time.Now()))
 		controller.markClientBad(fs.clientKey, first)
 		log.Printf("proxy copy ended with error flow_id=%d dir=up: %v", fs.id, first)
 	}
 	if !isExpectedPipeErr(second) {
-		controller.onTransportError("proxy_copy_down")
+		controller.onTransportError("proxy_copy_down", fs.client, fs.clientKey, flowLastActivityAt(fs, time.Now()))
 		controller.markClientBad(fs.clientKey, second)
 		log.Printf("proxy copy ended with error flow_id=%d dir=down: %v", fs.id, second)
 	}
@@ -2353,8 +3112,12 @@ func isExpectedPipeErr(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
 		return true
 	}
-	msg := err.Error()
-	return msg == "use of closed network connection" || msg == "EOF"
+	msg := strings.ToLower(err.Error())
+	return msg == "use of closed network connection" ||
+		msg == "eof" ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "forcibly closed by the remote host") ||
+		strings.Contains(msg, "broken pipe")
 }
 
 func isExpectedProbeErr(err error) bool {
@@ -2397,6 +3160,41 @@ func isSessionClientFatalErr(err error) bool {
 	return strings.Contains(msg, "use of closed network connection") ||
 		strings.Contains(msg, "application error 0x0") ||
 		strings.Contains(msg, "no recent network activity") ||
-		strings.Contains(msg, "context deadline exceeded") ||
 		strings.Contains(msg, "stream reset")
+}
+
+func shouldProbeManagedClient(now, lastUsed time.Time, refCount int) bool {
+	if refCount > 0 {
+		return false
+	}
+	if lastUsed.IsZero() {
+		return true
+	}
+	return now.Sub(lastUsed) >= managedClientProbeAge
+}
+
+func shouldReapManagedClient(now time.Time, mc *managedClient) bool {
+	if mc == nil || mc.refCount > 0 {
+		return false
+	}
+	if mc.broken {
+		return true
+	}
+	if mc.lastUsed.IsZero() {
+		return true
+	}
+	return now.Sub(mc.lastUsed) >= managedClientMaxIdle
+}
+
+func classifyManagedClientLease(now time.Time, lease sessionclient.SessionLease) managedClientLeaseDecision {
+	if lease.ExpiresAt.IsZero() {
+		return managedClientLeaseReuse
+	}
+	if !lease.ExpiresAt.After(now) {
+		return managedClientLeaseExpired
+	}
+	if lease.ExpiresAt.Sub(now) <= managedClientLeaseSkew {
+		return managedClientLeaseExpiring
+	}
+	return managedClientLeaseReuse
 }

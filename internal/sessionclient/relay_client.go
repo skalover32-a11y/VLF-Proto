@@ -99,6 +99,14 @@ func (c *relayClient) probeRTT(context.Context) (time.Duration, error) {
 	return 0, ErrRTTProbeUnsupported
 }
 
+func (c *relayClient) leaseState() (SessionLease, bool) {
+	return SessionLease{}, false
+}
+
+func (c *relayClient) unusableState() (SessionUnusableState, bool) {
+	return SessionUnusableState{}, false
+}
+
 func (f *relayTCPFlow) ID() uint64 {
 	return f.id
 }

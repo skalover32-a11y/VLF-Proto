@@ -154,6 +154,34 @@ func EncodeAuthOKPayload(p AuthOKPayload) []byte {
 	return b.Bytes()
 }
 
+func DecodeAuthOKPayload(raw []byte) (AuthOKPayload, error) {
+	r := bytes.NewReader(raw)
+
+	var payload AuthOKPayload
+	if err := binary.Read(r, binary.BigEndian, &payload.SessionID); err != nil {
+		return AuthOKPayload{}, fmt.Errorf("decode session_id: %w", err)
+	}
+	if err := binary.Read(r, binary.BigEndian, &payload.ExpiresMS); err != nil {
+		return AuthOKPayload{}, fmt.Errorf("decode expires_ms: %w", err)
+	}
+	if err := binary.Read(r, binary.BigEndian, &payload.UpKbps); err != nil {
+		return AuthOKPayload{}, fmt.Errorf("decode up_kbps: %w", err)
+	}
+	if err := binary.Read(r, binary.BigEndian, &payload.DownKbps); err != nil {
+		return AuthOKPayload{}, fmt.Errorf("decode down_kbps: %w", err)
+	}
+	if err := binary.Read(r, binary.BigEndian, &payload.MaxFlows); err != nil {
+		return AuthOKPayload{}, fmt.Errorf("decode max_flows: %w", err)
+	}
+	if err := binary.Read(r, binary.BigEndian, &payload.MaxUDPPPS); err != nil {
+		return AuthOKPayload{}, fmt.Errorf("decode max_udp_pps: %w", err)
+	}
+	if r.Len() != 0 {
+		return AuthOKPayload{}, errors.New("trailing bytes in AUTH_OK payload")
+	}
+	return payload, nil
+}
+
 type OpenPayload struct {
 	FlowID  uint64
 	DstHost string
