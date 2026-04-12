@@ -328,6 +328,7 @@ checkout_repo() {
 
 build_binary() {
   log "building transit binary"
+  run git config --global --add safe.directory "${INSTALL_DIR}"
   (
     cd "${INSTALL_DIR}"
     CGO_ENABLED=0 "${GO_BIN}" build -buildvcs=false -trimpath -ldflags "-s -w" -o "${BIN_PATH}" ./cmd/transit
