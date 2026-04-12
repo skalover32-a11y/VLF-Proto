@@ -330,7 +330,7 @@ build_binary() {
   log "building transit binary"
   (
     cd "${INSTALL_DIR}"
-    CGO_ENABLED=0 "${GO_BIN}" build -trimpath -ldflags "-s -w" -o "${BIN_PATH}" ./cmd/transit
+    CGO_ENABLED=0 "${GO_BIN}" build -buildvcs=false -trimpath -ldflags "-s -w" -o "${BIN_PATH}" ./cmd/transit
   )
   run chown root:root "${BIN_PATH}"
   run chmod 0755 "${BIN_PATH}"
