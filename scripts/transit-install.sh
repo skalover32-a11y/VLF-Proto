@@ -327,12 +327,16 @@ checkout_repo() {
 }
 
 build_binary() {
+  local build_dir
+  build_dir="$(mktemp -d)"
   log "building transit binary"
-  run git config --global --add safe.directory "${INSTALL_DIR}"
+  log "run: tar -C ${INSTALL_DIR} --exclude=.git -cf - . | tar -C ${build_dir} -xf -"
+  tar -C "${INSTALL_DIR}" --exclude=.git -cf - . | tar -C "${build_dir}" -xf -
   (
-    cd "${INSTALL_DIR}"
-    CGO_ENABLED=0 "${GO_BIN}" build -buildvcs=false -trimpath -ldflags "-s -w" -o "${BIN_PATH}" ./cmd/transit
+    cd "${build_dir}"
+    GOFLAGS="-buildvcs=false ${GOFLAGS:-}" CGO_ENABLED=0 "${GO_BIN}" build -trimpath -ldflags "-s -w" -o "${BIN_PATH}" ./cmd/transit
   )
+  run rm -rf "${build_dir}"
   run chown root:root "${BIN_PATH}"
   run chmod 0755 "${BIN_PATH}"
 }
