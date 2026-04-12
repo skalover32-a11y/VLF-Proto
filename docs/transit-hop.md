@@ -21,10 +21,18 @@ client -> transit node (vlf-transit) -> origin node (vlf-gateway)
 
 The origin node keeps running the regular VLF gateway.
 
-If relay traffic must pass through the transit hop, the origin relay listener must be reachable from the transit node. Prepare the origin node with:
+If relay traffic must pass through the transit hop, prepare the origin node with an interactive command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/<REF>/scripts/transit-origin-prepare.sh | sudo bash -s -- --bind-host 0.0.0.0 --ufw --allow-source <TRANSIT_IP>
+curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/<REF>/scripts/transit-origin-prepare.sh | sudo bash -s -- --bind-host 0.0.0.0 --ufw
+```
+
+The script will ask for the transit node IP/CIDR when `--allow-source` is not passed.
+
+Fully non-interactive form:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/<REF>/scripts/transit-origin-prepare.sh | sudo bash -s -- --bind-host 0.0.0.0 --ufw --allow-source 203.0.113.10
 ```
 
 What this does:
@@ -36,17 +44,33 @@ What this does:
 
 ### 2. Transit node
 
-Install the transit hop with:
+Install the transit hop with an interactive command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/<REF>/scripts/transit-install.sh | sudo bash -s -- --backend-host <ORIGIN_IP_OR_DNS> --ufw
+curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/<REF>/scripts/transit-install.sh | sudo bash -s -- --ufw
 ```
 
-If you omit required values such as `--backend-host` in an interactive shell, the installer prompts for them.
+The script will ask for the origin backend host when it is not passed.
+
+Fully non-interactive form:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/<REF>/scripts/transit-install.sh | sudo bash -s -- \
+  --backend-host 198.51.100.20 \
+  --backend-tcp-port 443 \
+  --backend-udp-port 443 \
+  --backend-relay-port 8080 \
+  --port-tcp 443 \
+  --port-udp 443 \
+  --port-udp-alt 8443 \
+  --relay-port 8080 \
+  --metrics-listen 127.0.0.1:9091 \
+  --ufw
+```
 
 Important flags:
 
-- `--backend-host <host>`: required origin gateway host/IP
+- `--backend-host <host>`: required origin gateway host/IP in non-interactive mode
 - `--backend-tcp-port <port>`: origin TCP lane, default `443`
 - `--backend-udp-port <port>`: origin UDP lane, default `443`
 - `--backend-relay-port <port>`: origin relay lane, default `8080`
