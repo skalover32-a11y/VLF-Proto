@@ -225,7 +225,9 @@ func (c *quicClient) auth(ctx context.Context, useExtendedAuth bool) error {
 		if state, ok := c.cfg.ResumeStore.Load(c.resumeKey); ok && state.ExpiresAt.After(time.Now()) {
 			authPayload.ResumeTag = append([]byte(nil), state.Tag...)
 			authPayload.ResumeToken = append([]byte(nil), state.Token...)
+			c.healthMu.Lock()
 			c.resumeAttempt = true
+			c.healthMu.Unlock()
 		}
 	}
 	c.debugState.setResumePath(ResumePathFullAuth)
@@ -253,7 +255,10 @@ func (c *quicClient) auth(ctx context.Context, useExtendedAuth bool) error {
 			return errLegacyPeerAuthUnsupported
 		}
 		c.setUnusableReason("auth_failed", time.Now())
-		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "quic", IdleResumeFailure: c.resumeAttempt})
+		c.healthMu.RLock()
+		resumeAttempt := c.resumeAttempt
+		c.healthMu.RUnlock()
+		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "quic", IdleResumeFailure: resumeAttempt})
 		return fmt.Errorf("AUTH failed: %s", reason)
 	}
 	if frame.Type != session.FrameAUTHOK {
@@ -267,7 +272,10 @@ func (c *quicClient) auth(ctx context.Context, useExtendedAuth bool) error {
 	c.storeAuthLease(authOK, time.Now())
 	c.applyAuthOKProfile(authOK.ProfileID)
 	resumeAccepted := c.storeResumeState(authOK)
-	if c.resumeAttempt {
+	c.healthMu.RLock()
+	resumeAttempt := c.resumeAttempt
+	c.healthMu.RUnlock()
+	if resumeAttempt {
 		if resumeAccepted {
 			c.debugState.setResumePath(ResumePathResumeFastPath)
 			c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "quic", IdleResumeSuccess: true})
