@@ -10,7 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	mrand "math/rand"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +22,10 @@ import (
 
 	"vlf-runtime/internal/auth"
 	"vlf-runtime/internal/session"
+	"vlf-runtime/internal/transport/health"
+	"vlf-runtime/internal/transport/migration"
+	"vlf-runtime/internal/transport/profile"
+	"vlf-runtime/internal/transport/resume"
 )
 
 type quicClient struct {
@@ -38,13 +45,27 @@ type quicClient struct {
 	udpMu    sync.RWMutex
 	udpFlows map[uint64]*quicUDPFlow
 
-	pendingMu   sync.Mutex
-	pendingOpen map[uint64]chan quicOpenResult
-	pendingPing map[string]chan error
+	pendingMu      sync.Mutex
+	pendingOpen    map[uint64]chan quicOpenResult
+	pendingPing    map[string]chan error
+	pendingProfile chan quicProfileResult
 
 	leaseMu  sync.RWMutex
 	lease    SessionLease
 	hasLease bool
+
+	profileRegistry     *profile.Registry
+	profileMu           sync.RWMutex
+	currentProfileState profile.TransportProfile
+
+	healthMu      sync.RWMutex
+	healthEngine  *health.Engine
+	lastRTTMs     float64
+	hasRTTSample  bool
+	scheduler     *migration.Scheduler
+	resumeKey     string
+	resumeAttempt bool
+	debugState    clientDebugState
 
 	unusableMu sync.RWMutex
 	unusable   SessionUnusableState
@@ -89,7 +110,31 @@ type quicOpenResult struct {
 	err error
 }
 
+type quicProfileResult struct {
+	profileID string
+	err       error
+}
+
 func dialQUIC(ctx context.Context, cfg Config) (*quicClient, error) {
+	useExtendedAuth := cfg.TransportProfilesEnabled || cfg.ResumeTokensEnabled
+	client, err := dialQUICAttempt(ctx, cfg, useExtendedAuth)
+	if err == nil {
+		return client, nil
+	}
+	if useExtendedAuth && errors.Is(err, errLegacyPeerAuthUnsupported) {
+		debugf(cfg, "auth_fallback_to_legacy transport=quic reason=legacy_peer_rejected_extended_auth")
+		client, legacyErr := dialQUICAttempt(ctx, cfg, false)
+		if legacyErr != nil {
+			return nil, legacyErr
+		}
+		client.debugState.markLegacyFallback("legacy peer rejected extended auth")
+		debugf(cfg, "transport_feature_fallback transport=quic feature=profiles_resume mode=legacy_auth")
+		return client, nil
+	}
+	return nil, err
+}
+
+func dialQUICAttempt(ctx context.Context, cfg Config, useExtendedAuth bool) (*quicClient, error) {
 	dialCtx, cancelDial := context.WithTimeout(ctx, cfg.QUICTimeout)
 	defer cancelDial()
 
@@ -108,15 +153,30 @@ func dialQUIC(ctx context.Context, cfg Config) (*quicClient, error) {
 	}
 
 	clientCtx, cancelClient := context.WithCancel(context.Background())
+	reg := cfg.ProfileRegistry
+	if reg == nil {
+		reg = profile.DefaultRegistry()
+	}
+	active := reg.MustGetOrDefault(cfg.TransportProfileID)
 	c := &quicClient{
-		cfg:         cfg,
-		conn:        conn,
-		ctx:         clientCtx,
-		cancel:      cancelClient,
-		tcpFlows:    make(map[uint64]*quicTCPFlow),
-		udpFlows:    make(map[uint64]*quicUDPFlow),
-		pendingOpen: make(map[uint64]chan quicOpenResult),
-		pendingPing: make(map[string]chan error),
+		cfg:                 cfg,
+		conn:                conn,
+		ctx:                 clientCtx,
+		cancel:              cancelClient,
+		tcpFlows:            make(map[uint64]*quicTCPFlow),
+		udpFlows:            make(map[uint64]*quicUDPFlow),
+		pendingOpen:         make(map[uint64]chan quicOpenResult),
+		pendingPing:         make(map[string]chan error),
+		profileRegistry:     reg,
+		currentProfileState: active,
+		resumeKey:           resume.Key(firstNonEmpty(cfg.GatewayHost, cfg.GatewayDialHost), cfg.ClientID),
+	}
+	c.debugState.init(active.ID, time.Now())
+	if cfg.ProfileScoringEnabled {
+		c.healthEngine = health.NewEngine(health.Config{})
+	}
+	if cfg.ProfileMigrationEnabled && cfg.TransportProfilesEnabled {
+		c.scheduler = migration.NewScheduler(migration.Config{}, reg)
 	}
 
 	control, err := conn.OpenStreamSync(ctx)
@@ -129,7 +189,7 @@ func dialQUIC(ctx context.Context, cfg Config) (*quicClient, error) {
 	c.control = control
 	c.controlR = bufio.NewReader(control)
 
-	if err := c.auth(ctx); err != nil {
+	if err := c.auth(ctx, useExtendedAuth); err != nil {
 		_ = conn.CloseWithError(0, "auth_failed")
 		cancelClient()
 		return nil, err
@@ -137,10 +197,13 @@ func dialQUIC(ctx context.Context, cfg Config) (*quicClient, error) {
 
 	go c.controlLoop()
 	go c.datagramLoop()
+	if c.scheduler != nil && c.healthEngine != nil {
+		go c.migrationLoop()
+	}
 	return c, nil
 }
 
-func (c *quicClient) auth(ctx context.Context) error {
+func (c *quicClient) auth(ctx context.Context, useExtendedAuth bool) error {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
 		return wrapErr("nonce generation", err)
@@ -148,14 +211,26 @@ func (c *quicClient) auth(ctx context.Context) error {
 	ts := uint64(time.Now().UnixMilli())
 	caps := uint64(0b1111)
 	sig := signSession(c.cfg.Secret, auth.SessionAuthMaterial(c.cfg.ClientID, ts, nonce, caps))
-
-	payload := session.EncodeAuthPayload(session.AuthPayload{
+	authPayload := session.AuthPayload{
 		ClientID: c.cfg.ClientID,
 		TSMS:     ts,
 		Nonce:    nonce,
 		Sig:      sig,
 		Caps:     caps,
-	})
+	}
+	if useExtendedAuth && c.cfg.TransportProfilesEnabled {
+		authPayload.ProfileID = c.activeProfileID()
+	}
+	if useExtendedAuth && c.cfg.ResumeTokensEnabled && c.cfg.ResumeStore != nil {
+		if state, ok := c.cfg.ResumeStore.Load(c.resumeKey); ok && state.ExpiresAt.After(time.Now()) {
+			authPayload.ResumeTag = append([]byte(nil), state.Tag...)
+			authPayload.ResumeToken = append([]byte(nil), state.Token...)
+			c.resumeAttempt = true
+		}
+	}
+	c.debugState.setResumePath(ResumePathFullAuth)
+
+	payload := session.EncodeAuthPayload(authPayload)
 
 	c.ctrlMu.Lock()
 	defer c.ctrlMu.Unlock()
@@ -166,12 +241,20 @@ func (c *quicClient) auth(ctx context.Context) error {
 
 	frame, err := c.readControlFrameLocked(ctx, 6*time.Second)
 	if err != nil {
+		if useExtendedAuth && isLegacyAuthCloseBeforeOK(err) {
+			return errLegacyPeerAuthUnsupported
+		}
 		return wrapErr("read AUTH response", err)
 	}
 
 	if frame.Type == session.FrameAUTHFAIL {
+		reason := decodeAuthFailReason(frame.Payload)
+		if useExtendedAuth && isLegacyAuthUnsupportedReason(reason) {
+			return errLegacyPeerAuthUnsupported
+		}
 		c.setUnusableReason("auth_failed", time.Now())
-		return fmt.Errorf("AUTH failed: %s", decodeAuthFailReason(frame.Payload))
+		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "quic", IdleResumeFailure: c.resumeAttempt})
+		return fmt.Errorf("AUTH failed: %s", reason)
 	}
 	if frame.Type != session.FrameAUTHOK {
 		return fmt.Errorf("expected AUTH_OK, got %d", frame.Type)
@@ -182,6 +265,16 @@ func (c *quicClient) auth(ctx context.Context) error {
 		return wrapErr("decode AUTH_OK", err)
 	}
 	c.storeAuthLease(authOK, time.Now())
+	c.applyAuthOKProfile(authOK.ProfileID)
+	resumeAccepted := c.storeResumeState(authOK)
+	if c.resumeAttempt {
+		if resumeAccepted {
+			c.debugState.setResumePath(ResumePathResumeFastPath)
+			c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "quic", IdleResumeSuccess: true})
+		} else {
+			debugf(c.cfg, "transport_feature_fallback transport=quic feature=resume_tokens mode=full_auth reason=peer_did_not_confirm_resume")
+		}
+	}
 
 	return nil
 }
@@ -284,7 +377,11 @@ func (c *quicClient) openFlow(
 		return wrapErr("write open frame", err)
 	}
 
-	waitCtx, cancel := expectTimeout(ctx, 6*time.Second)
+	waitTimeout := 6 * time.Second
+	if retry := c.currentProfile().RetryPolicy.OpenBackoff; retry > 0 && retry > waitTimeout {
+		waitTimeout = retry
+	}
+	waitCtx, cancel := expectTimeout(ctx, waitTimeout)
 	defer cancel()
 
 	select {
@@ -297,16 +394,19 @@ func (c *quicClient) openFlow(
 		}
 		if out.ok {
 			debugf(c.cfg, "control open_request_completed transport=quic flow_id=%d status=ok", flowID)
+			c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "quic"})
 			return nil
 		}
 		debugf(c.cfg, "control open_request_completed transport=quic flow_id=%d status=fail err=%v", flowID, out.err)
 		if out.err != nil {
+			c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "quic", TimeoutRate: 1, RecoveryEvent: true})
 			return out.err
 		}
 		return errors.New("open flow rejected")
 	case <-waitCtx.Done():
 		c.unregisterPendingOpen(flowID)
 		debugf(c.cfg, "control open_request_timed_out transport=quic flow_id=%d", flowID)
+		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "quic", TimeoutRate: 1, RecoveryEvent: true})
 		return wrapErr("read open response", waitCtx.Err())
 	}
 }
@@ -316,7 +416,9 @@ func (c *quicClient) probeRTT(ctx context.Context) (time.Duration, error) {
 		return 0, io.EOF
 	}
 
-	probeCtx, cancel := expectTimeout(ctx, 1500*time.Millisecond)
+	profileCfg := c.currentProfile()
+	probeTimeout := profileProbeTimeout(profileCfg, 1500*time.Millisecond)
+	probeCtx, cancel := expectTimeout(ctx, probeTimeout)
 	defer cancel()
 
 	token := make([]byte, 12)
@@ -326,14 +428,15 @@ func (c *quicClient) probeRTT(ctx context.Context) (time.Duration, error) {
 	}
 
 	start := time.Now()
-	key := string(token)
+	payload := profileProbePayload(token, profileCfg)
+	key := string(payload)
 	waitCh := make(chan error, 1)
 
 	c.pendingMu.Lock()
 	c.pendingPing[key] = waitCh
 	c.pendingMu.Unlock()
 
-	if err := c.writeControlFrame(session.FramePING, token); err != nil {
+	if err := c.writeControlFrame(session.FramePING, payload); err != nil {
 		c.unregisterPendingPing(key)
 		return 0, err
 	}
@@ -347,11 +450,15 @@ func (c *quicClient) probeRTT(ctx context.Context) (time.Duration, error) {
 			return 0, io.EOF
 		}
 		if err != nil {
+			c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "quic", TimeoutRate: 1})
 			return 0, err
 		}
-		return time.Since(start), nil
+		rtt := time.Since(start)
+		c.observeRTT(rtt, "quic")
+		return rtt, nil
 	case <-probeCtx.Done():
 		c.unregisterPendingPing(key)
+		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "quic", TimeoutRate: 1, AckStarved: true})
 		return 0, probeCtx.Err()
 	}
 }
@@ -411,6 +518,18 @@ func (c *quicClient) handleControlFrame(frame *session.Frame) {
 		c.resolvePendingOpenOK(frame.Type, frame.Payload)
 	case session.FrameOPENUDPFAIL:
 		c.resolvePendingOpenFail(frame.Type, frame.Payload)
+	case session.FramePROFILEOK:
+		c.resolvePendingProfile(frame.Type, frame.Payload, nil)
+	case session.FramePROFILEFAIL:
+		payload, err := session.DecodeProfilePayload(frame.Payload)
+		if err != nil {
+			c.resolvePendingProfile(frame.Type, nil, errors.New("invalid profile fail payload"))
+			return
+		}
+		if payload.Reason == "" {
+			payload.Reason = "profile switch rejected"
+		}
+		c.resolvePendingProfile(frame.Type, frame.Payload, errors.New(payload.Reason))
 	case session.FrameCLOSEFLOW:
 		payload, err := session.DecodeCloseFlowPayload(frame.Payload)
 		if err != nil {
@@ -485,7 +604,7 @@ func (c *quicClient) closeWithError(err error, reason string, markUnhealthy bool
 
 		c.cancel()
 
-		pendingOpen, pendingPing := c.drainPending()
+		pendingOpen, pendingPing, pendingProfile := c.drainPending()
 		tcpFlows, udpFlows := c.snapshotFlows()
 
 		for _, flow := range tcpFlows {
@@ -506,6 +625,10 @@ func (c *quicClient) closeWithError(err error, reason string, markUnhealthy bool
 			}
 			close(ch)
 		}
+		if pendingProfile != nil {
+			pendingProfile <- quicProfileResult{err: err}
+			close(pendingProfile)
+		}
 
 		if c.control != nil {
 			_ = c.control.Close()
@@ -513,6 +636,7 @@ func (c *quicClient) closeWithError(err error, reason string, markUnhealthy bool
 		if c.conn != nil {
 			closeErr = c.conn.CloseWithError(0, reason)
 		}
+		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "quic", PathFlap: true, ReceiveStalled: true, RecoveryEvent: true})
 	})
 	return closeErr
 }
@@ -537,7 +661,7 @@ func (c *quicClient) snapshotFlows() ([]*quicTCPFlow, []*quicUDPFlow) {
 	return tcpFlows, udpFlows
 }
 
-func (c *quicClient) drainPending() ([]chan quicOpenResult, []chan error) {
+func (c *quicClient) drainPending() ([]chan quicOpenResult, []chan error, chan quicProfileResult) {
 	c.pendingMu.Lock()
 	openChans := make([]chan quicOpenResult, 0, len(c.pendingOpen))
 	for flowID, ch := range c.pendingOpen {
@@ -549,9 +673,11 @@ func (c *quicClient) drainPending() ([]chan quicOpenResult, []chan error) {
 		pingChans = append(pingChans, ch)
 		delete(c.pendingPing, key)
 	}
+	profileCh := c.pendingProfile
+	c.pendingProfile = nil
 	c.pendingMu.Unlock()
 
-	return openChans, pingChans
+	return openChans, pingChans, profileCh
 }
 
 func (c *quicClient) registerPendingOpen(flowID uint64) (chan quicOpenResult, error) {
@@ -622,6 +748,148 @@ func (c *quicClient) failPendingOpen(flowID uint64, err error) {
 	close(ch)
 }
 
+func (c *quicClient) activeProfile() string {
+	return c.activeProfileID()
+}
+
+func (c *quicClient) activeProfileID() string {
+	c.profileMu.RLock()
+	defer c.profileMu.RUnlock()
+	return c.currentProfileState.ID
+}
+
+func (c *quicClient) currentProfile() profile.TransportProfile {
+	c.profileMu.RLock()
+	defer c.profileMu.RUnlock()
+	return c.currentProfileState
+}
+
+func (c *quicClient) setActiveProfileByID(id string) profile.TransportProfile {
+	next := c.profileRegistry.MustGetOrDefault(id)
+	c.profileMu.Lock()
+	c.currentProfileState = next
+	c.profileMu.Unlock()
+	return next
+}
+
+func (c *quicClient) applyAuthOKProfile(id string) {
+	if !c.cfg.TransportProfilesEnabled {
+		return
+	}
+	if id == "" {
+		return
+	}
+	applied := c.setActiveProfileByID(id)
+	c.debugState.noteProfile(applied.ID, time.Now())
+	debugf(c.cfg, "transport_profile_applied transport=quic profile_id=%s reason=auth_ok", applied.ID)
+}
+
+func (c *quicClient) healthSnapshot() (health.Snapshot, bool) {
+	c.healthMu.RLock()
+	engine := c.healthEngine
+	c.healthMu.RUnlock()
+	if engine == nil {
+		return health.Snapshot{}, false
+	}
+	return engine.Evaluate(time.Now()), true
+}
+
+func (c *quicClient) debugSnapshot() (DebugSnapshot, bool) {
+	now := time.Now()
+	snapshot := c.debugState.snapshot(now)
+	snapshot.ActiveProfile = c.activeProfileID()
+	if lease, ok := c.leaseState(); ok {
+		snapshot.SessionLease = lease
+		snapshot.HasSessionLease = true
+	}
+	if unusable, ok := c.unusableState(); ok {
+		snapshot.SessionUnusable = unusable
+		snapshot.HasSessionUnusable = true
+	}
+	if healthSnap, ok := c.healthSnapshot(); ok {
+		snapshot.HealthScore = healthSnap.Score
+		snapshot.DegradationLevel = healthSnap.Level
+		snapshot.DegradationReasonFlags = append([]health.ReasonFlag(nil), healthSnap.Flags...)
+	}
+	if c.scheduler != nil {
+		sched := c.scheduler.Snapshot(now)
+		snapshot.MigrationCooldownRemaining = sched.CooldownRemaining
+		snapshot.MigrationCooldownActive = sched.CooldownRemaining > 0
+	}
+	return snapshot, true
+}
+
+func (c *quicClient) ApplyTransportProfile(ctx context.Context, profileID string) error {
+	return c.applyTransportProfile(ctx, profileID)
+}
+
+func (c *quicClient) applyTransportProfile(ctx context.Context, profileID string) error {
+	if !c.cfg.TransportProfilesEnabled {
+		return nil
+	}
+	next, ok := c.profileRegistry.Get(profileID)
+	if !ok {
+		return fmt.Errorf("unknown transport profile %q", profileID)
+	}
+	if next.ID == c.activeProfileID() {
+		return nil
+	}
+	if !c.cfg.ProfileMigrationEnabled {
+		c.setActiveProfileByID(next.ID)
+		c.debugState.noteProfile(next.ID, time.Now())
+		return nil
+	}
+	if unsupported, reason := c.debugState.profileSwitchUnsupportedState(); unsupported {
+		debugf(c.cfg, "transport_feature_fallback transport=quic feature=profile_migration requested=%s active=%s reason=%s", next.ID, c.activeProfileID(), reason)
+		return ErrProfileSwitchUnsupported
+	}
+
+	c.debugState.noteMigrationAttempt("apply_transport_profile", time.Now())
+	respCh, err := c.registerPendingProfile()
+	if err != nil {
+		return err
+	}
+	if err := c.writeControlFrame(session.FramePROFILESET, session.EncodeProfilePayload(session.ProfilePayload{ProfileID: next.ID})); err != nil {
+		c.failPendingProfile(err)
+		return wrapErr("write profile switch", err)
+	}
+
+	waitTimeout := 4 * time.Second
+	if retry := c.currentProfile().RetryPolicy.OpenBackoff; retry > 0 {
+		waitTimeout = retry
+	}
+	waitCtx, cancel := expectTimeout(ctx, waitTimeout)
+	defer cancel()
+
+	select {
+	case out, ok := <-respCh:
+		if !ok {
+			if err := c.currentCloseErr(); err != nil {
+				return err
+			}
+			return io.EOF
+		}
+		if out.err != nil {
+			if errors.Is(out.err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(out.err.Error()), "migration disabled") {
+				c.debugState.markProfileSwitchUnsupported(out.err.Error())
+				debugf(c.cfg, "transport_feature_fallback transport=quic feature=profile_migration requested=%s reason=%s", next.ID, out.err)
+				return fmt.Errorf("%w: %s", ErrProfileSwitchUnsupported, out.err)
+			}
+			return out.err
+		}
+		applied := c.setActiveProfileByID(firstNonEmpty(out.profileID, next.ID))
+		c.debugState.noteProfile(applied.ID, time.Now())
+		c.debugState.noteMigrationSuccess(time.Now())
+		debugf(c.cfg, "transport_profile_applied transport=quic profile_id=%s reason=profile_ok", applied.ID)
+		return nil
+	case <-waitCtx.Done():
+		c.unregisterPendingProfile()
+		c.debugState.markProfileSwitchUnsupported(waitCtx.Err().Error())
+		debugf(c.cfg, "transport_feature_fallback transport=quic feature=profile_migration requested=%s reason=%v", next.ID, waitCtx.Err())
+		return fmt.Errorf("%w: %v", ErrProfileSwitchUnsupported, waitCtx.Err())
+	}
+}
+
 func (c *quicClient) leaseState() (SessionLease, bool) {
 	c.leaseMu.RLock()
 	defer c.leaseMu.RUnlock()
@@ -677,6 +945,25 @@ func (c *quicClient) storeAuthLease(payload session.AuthOKPayload, now time.Time
 	)
 }
 
+func (c *quicClient) storeResumeState(payload session.AuthOKPayload) bool {
+	if !c.cfg.ResumeTokensEnabled || c.cfg.ResumeStore == nil || len(payload.ResumeTag) == 0 || len(payload.ResumeToken) == 0 {
+		return false
+	}
+	lease, ok := c.leaseState()
+	if !ok {
+		return false
+	}
+	c.cfg.ResumeStore.Save(c.resumeKey, resume.State{
+		Tag:        append([]byte(nil), payload.ResumeTag...),
+		Token:      append([]byte(nil), payload.ResumeToken...),
+		ExpiresAt:  lease.ExpiresAt,
+		ProfileID:  firstNonEmpty(payload.ProfileID, c.activeProfileID()),
+		PathFamily: "quic",
+		Lineage:    lease.SessionID,
+	})
+	return true
+}
+
 func (c *quicClient) touchLeaseNow() {
 	c.touchLeaseAt(time.Now())
 }
@@ -688,6 +975,54 @@ func (c *quicClient) touchLeaseAt(now time.Time) {
 		c.lease.ExpiresAt = now.Add(c.lease.TTL)
 	}
 	c.leaseMu.Unlock()
+}
+
+func (c *quicClient) observeHealth(sample health.Sample) {
+	c.healthMu.RLock()
+	engine := c.healthEngine
+	c.healthMu.RUnlock()
+	if engine == nil {
+		return
+	}
+	if sample.At.IsZero() {
+		sample.At = time.Now()
+	}
+	if sample.ProfileID == "" {
+		sample.ProfileID = c.activeProfileID()
+	}
+	if sample.PathFamily == "" {
+		sample.PathFamily = "quic"
+	}
+	engine.Observe(sample)
+}
+
+func (c *quicClient) observeRTT(rtt time.Duration, pathFamily string) {
+	if rtt <= 0 {
+		return
+	}
+	rttMs := float64(rtt.Milliseconds())
+	if rttMs <= 0 {
+		rttMs = float64(rtt) / float64(time.Millisecond)
+	}
+	c.healthMu.Lock()
+	jitter := 0.0
+	if c.hasRTTSample {
+		jitter = math.Abs(c.lastRTTMs - rttMs)
+	}
+	c.lastRTTMs = rttMs
+	c.hasRTTSample = true
+	engine := c.healthEngine
+	c.healthMu.Unlock()
+	if engine == nil {
+		return
+	}
+	engine.Observe(health.Sample{
+		At:         time.Now(),
+		ProfileID:  c.activeProfileID(),
+		PathFamily: pathFamily,
+		RTTMs:      rttMs,
+		JitterMs:   jitter,
+	})
 }
 
 func (c *quicClient) setUnusableReason(reason string, now time.Time) {
@@ -747,6 +1082,67 @@ func (c *quicClient) resolvePendingPing(payload []byte) bool {
 	return true
 }
 
+func (c *quicClient) registerPendingProfile() (chan quicProfileResult, error) {
+	respCh := make(chan quicProfileResult, 1)
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if c.pendingProfile != nil {
+		return nil, errors.New("profile switch already pending")
+	}
+	c.pendingProfile = respCh
+	return respCh, nil
+}
+
+func (c *quicClient) resolvePendingProfile(frameType uint64, payload []byte, err error) {
+	c.pendingMu.Lock()
+	ch := c.pendingProfile
+	if ch != nil {
+		c.pendingProfile = nil
+	}
+	c.pendingMu.Unlock()
+	if ch == nil {
+		debugf(c.cfg, "unsolicited_control_message transport=quic type=%d detail=profile_response_without_pending", frameType)
+		return
+	}
+	profileID := ""
+	if len(payload) > 0 {
+		if decoded, decodeErr := session.DecodeProfilePayload(payload); decodeErr == nil {
+			profileID = decoded.ProfileID
+			if err == nil && decoded.Reason != "" {
+				err = errors.New(decoded.Reason)
+			}
+		}
+	}
+	ch <- quicProfileResult{profileID: profileID, err: err}
+	close(ch)
+}
+
+func (c *quicClient) failPendingProfile(err error) {
+	c.pendingMu.Lock()
+	ch := c.pendingProfile
+	if ch != nil {
+		c.pendingProfile = nil
+	}
+	c.pendingMu.Unlock()
+	if ch == nil {
+		return
+	}
+	ch <- quicProfileResult{err: err}
+	close(ch)
+}
+
+func (c *quicClient) unregisterPendingProfile() {
+	c.pendingMu.Lock()
+	ch := c.pendingProfile
+	if ch != nil {
+		c.pendingProfile = nil
+	}
+	c.pendingMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
 func (c *quicClient) setCloseErr(err error) {
 	c.stateMu.Lock()
 	if c.closeErr == nil {
@@ -759,6 +1155,42 @@ func (c *quicClient) currentCloseErr() error {
 	c.stateMu.RLock()
 	defer c.stateMu.RUnlock()
 	return c.closeErr
+}
+
+func (c *quicClient) migrationLoop() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			if unsupported, reason := c.debugState.profileSwitchUnsupportedState(); unsupported {
+				debugf(c.cfg, "profile_migration_skipped transport=quic reason=%s", reason)
+				continue
+			}
+			snap, ok := c.healthSnapshot()
+			if !ok {
+				continue
+			}
+			decision := c.scheduler.ChooseNextProfile(c.activeProfileID(), snap, migration.PathInfo{
+				Family:         string(c.currentProfile().Family),
+				DegradedPathOK: true,
+			}, time.Now())
+			if decision.Action != "switch" || decision.NextProfile == "" || decision.NextProfile == c.activeProfileID() {
+				continue
+			}
+			debugf(c.cfg, "profile_migration_attempt transport=quic current=%s next=%s reason=%s", decision.CurrentProfile, decision.NextProfile, decision.Reason)
+			result := c.scheduler.AttemptProfileMigration(c.ctx, c, decision.CurrentProfile, decision.NextProfile)
+			c.scheduler.RecordSwitchResult(decision.CurrentProfile, decision.NextProfile, result.Err == nil, false, time.Now())
+			if result.Err != nil {
+				debugf(c.cfg, "profile_migration_failed transport=quic current=%s next=%s err=%v", decision.CurrentProfile, decision.NextProfile, result.Err)
+				continue
+			}
+			debugf(c.cfg, "profile_migration_applied transport=quic current=%s next=%s", decision.CurrentProfile, decision.NextProfile)
+		}
+	}
 }
 
 func (f *quicTCPFlow) ID() uint64 {
@@ -870,19 +1302,33 @@ func (f *quicUDPFlow) ID() uint64 {
 
 func (f *quicUDPFlow) Send(ctx context.Context, payload []byte) error {
 	seq := f.seq.Add(1)
-	packets, err := session.FragmentDatagram(f.id, seq, payload, f.client.cfg.MaxDgramPayload)
+	profileCfg := f.client.currentProfile()
+	maxPayload := profileCfg.EffectiveDatagramPayload(f.client.cfg.MaxDgramPayload)
+	packets, err := session.FragmentDatagram(f.id, seq, payload, maxPayload)
 	if err != nil {
 		return err
 	}
 
-	for _, pkt := range packets {
+	for i, pkt := range packets {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 		if err := f.client.conn.SendDatagram(pkt); err != nil {
+			f.client.observeHealth(health.Sample{At: time.Now(), ProfileID: f.client.activeProfileID(), PathFamily: "quic", BurstDrop: true, TimeoutRate: 1})
 			return err
+		}
+		if sleep := profileBurstPause(profileCfg, i, len(packets)); sleep > 0 {
+			timer := time.NewTimer(sleep)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 	f.client.touchLeaseNow()
@@ -1058,4 +1504,20 @@ func signSession(secret []byte, payload []byte) []byte {
 	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write(payload)
 	return mac.Sum(nil)
+}
+
+func profileSendGap(p profile.TransportProfile) time.Duration {
+	base := p.InterPacketTimingStrategy.BaseGap
+	jitter := p.InterPacketTimingStrategy.GapJitter
+	if base <= 0 && jitter <= 0 {
+		return 0
+	}
+	if jitter <= 0 {
+		return base
+	}
+	delta := time.Duration(mrand.Int63n(int64(jitter)*2+1)) - jitter
+	if base+delta <= 0 {
+		return time.Millisecond
+	}
+	return base + delta
 }

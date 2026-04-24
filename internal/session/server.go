@@ -17,22 +17,30 @@ import (
 	"vlf-runtime/internal/limits"
 	"vlf-runtime/internal/metrics"
 	"vlf-runtime/internal/store"
+	"vlf-runtime/internal/transport/profile"
+	"vlf-runtime/internal/transport/resume"
 )
 
 type Config struct {
-	ListenQUIC      string
-	ListenTCP       string
-	TLSConfig       *tls.Config
-	IdleTimeout     time.Duration
-	DialTimeout     time.Duration
-	MaxFlows        int
-	MaxDgramPayload int
-	UpKbps          int
-	DownKbps        int
-	MaxUDPPPS       int
-	KeepAlive       time.Duration
-	DatagramWorkers int
-	DatagramQueue   int
+	ListenQUIC               string
+	ListenTCP                string
+	TLSConfig                *tls.Config
+	IdleTimeout              time.Duration
+	DialTimeout              time.Duration
+	MaxFlows                 int
+	MaxDgramPayload          int
+	UpKbps                   int
+	DownKbps                 int
+	MaxUDPPPS                int
+	KeepAlive                time.Duration
+	DatagramWorkers          int
+	DatagramQueue            int
+	TransportProfilesEnabled bool
+	ProfileMigrationEnabled  bool
+	DefaultProfileID         string
+	ProfileRegistry          *profile.Registry
+	ResumeTokensEnabled      bool
+	ResumeManager            *resume.Manager
 }
 
 type Server struct {
@@ -46,6 +54,9 @@ type Server struct {
 	tcpListener  net.Listener
 
 	store *store.SessionStore
+
+	profiles      *profile.Registry
+	resumeManager *resume.Manager
 
 	mu       sync.RWMutex
 	sessions map[uint64]managedSession
@@ -67,14 +78,22 @@ func NewServer(cfg Config, verifier *auth.Verifier, lim *limits.Manager, m *metr
 	}
 
 	wheel := store.NewWheel(time.Second, 512)
+	if cfg.DefaultProfileID == "" {
+		cfg.DefaultProfileID = profile.ProfileBalanced
+	}
+	if cfg.ProfileRegistry == nil {
+		cfg.ProfileRegistry = profile.DefaultRegistry()
+	}
 	return &Server{
-		cfg:      cfg,
-		verifier: verifier,
-		limits:   lim,
-		metrics:  m,
-		logger:   logger,
-		store:    store.NewSessionStore(wheel),
-		sessions: make(map[uint64]managedSession),
+		cfg:           cfg,
+		verifier:      verifier,
+		limits:        lim,
+		metrics:       m,
+		logger:        logger,
+		store:         store.NewSessionStore(wheel),
+		profiles:      cfg.ProfileRegistry,
+		resumeManager: cfg.ResumeManager,
+		sessions:      make(map[uint64]managedSession),
 	}
 }
 

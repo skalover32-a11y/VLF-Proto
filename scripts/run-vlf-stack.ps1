@@ -2,7 +2,7 @@
 Run VLF socks_client + sing-box in one PowerShell window with merged logs.
 
 Examples:
-  .\scripts\run-vlf-stack.ps1 -GatewayHost troynichek-live.ru -GatewayIP 5.180.46.33 -SingBoxConfig .\config.json
+  .\scripts\run-vlf-stack.ps1 -GatewayHost example.com -GatewayIP 203.0.113.10 -SingBoxConfig .\config.json
   .\scripts\run-vlf-stack.ps1 -Build -Debug -DisableTcpSession -DisableRelayFallback
 #>
 

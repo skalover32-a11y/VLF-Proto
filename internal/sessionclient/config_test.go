@@ -1,6 +1,9 @@
 package sessionclient
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestBuildProtoIDList(t *testing.T) {
 	got := buildProtoIDList(" custom/1 ", []string{"vlf-runtime/0.1", "custom/1", "legacy/0.9", " ", "vlf-session/0.1"})
@@ -23,5 +26,36 @@ func TestBuildProtoIDListFallbackDefault(t *testing.T) {
 	}
 	if got[0] != "vlf-runtime/0.1" {
 		t.Fatalf("unexpected first proto: %q", got[0])
+	}
+}
+
+func TestTLSConfigProductionRequiresSPKIPin(t *testing.T) {
+	cfg := Config{
+		GatewayHost:   "example.com",
+		TLSServerName: "example.com",
+		Production:    true,
+		ProtoID:       "vlf-runtime/0.1",
+	}
+
+	if _, err := cfg.TLSConfig(); err == nil {
+		t.Fatal("TLSConfig succeeded without SPKI pin in production mode")
+	}
+}
+
+func TestTLSConfigProductionWithSPKIPin(t *testing.T) {
+	cfg := Config{
+		GatewayHost:   "example.com",
+		TLSServerName: "example.com",
+		Production:    true,
+		ProtoID:       "vlf-runtime/0.1",
+		PinSPKI:       strings.Repeat("A", 43) + "=",
+	}
+
+	tlsConf, err := cfg.TLSConfig()
+	if err != nil {
+		t.Fatalf("TLSConfig: %v", err)
+	}
+	if tlsConf.VerifyPeerCertificate == nil {
+		t.Fatal("VerifyPeerCertificate is nil with production SPKI pin")
 	}
 }

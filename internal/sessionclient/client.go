@@ -2,6 +2,7 @@ package sessionclient
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"vlf-runtime/internal/transport/health"
 )
 
 type Transport string
@@ -72,6 +75,10 @@ type clientInner interface {
 	probeRTT(ctx context.Context) (time.Duration, error)
 	leaseState() (SessionLease, bool)
 	unusableState() (SessionUnusableState, bool)
+	activeProfile() string
+	healthSnapshot() (health.Snapshot, bool)
+	applyTransportProfile(ctx context.Context, profileID string) error
+	debugSnapshot() (DebugSnapshot, bool)
 	close() error
 }
 
@@ -204,6 +211,47 @@ func (c *Client) SessionUnusableReason() (SessionUnusableState, bool) {
 	return c.inner.unusableState()
 }
 
+func (c *Client) ActiveProfile() string {
+	if c == nil || c.inner == nil {
+		return ""
+	}
+	return c.inner.activeProfile()
+}
+
+func (c *Client) HealthSnapshot() (health.Snapshot, bool) {
+	if c == nil || c.inner == nil {
+		return health.Snapshot{}, false
+	}
+	return c.inner.healthSnapshot()
+}
+
+func (c *Client) ApplyTransportProfile(ctx context.Context, profileID string) error {
+	if c == nil || c.inner == nil {
+		return io.EOF
+	}
+	return c.inner.applyTransportProfile(ctx, profileID)
+}
+
+func (c *Client) DebugSnapshot() (DebugSnapshot, bool) {
+	if c == nil || c.inner == nil {
+		return DebugSnapshot{}, false
+	}
+	snapshot, ok := c.inner.debugSnapshot()
+	if !ok {
+		return DebugSnapshot{}, false
+	}
+	snapshot.Transport = c.transport
+	return snapshot, true
+}
+
+func (c *Client) DebugDumpJSON() ([]byte, error) {
+	snapshot, ok := c.DebugSnapshot()
+	if !ok {
+		return json.MarshalIndent(DebugSnapshot{Transport: c.transport}, "", "  ")
+	}
+	return MarshalDebugSnapshot(snapshot)
+}
+
 func debugf(cfg Config, format string, args ...any) {
 	if !cfg.Debug {
 		return
@@ -223,4 +271,14 @@ func wrapErr(stage string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("%s: %w", stage, err)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }

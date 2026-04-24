@@ -34,22 +34,26 @@ type Server struct {
 	metrics  *metrics.Metrics
 	logger   *zap.Logger
 	mux      *http.ServeMux
+	enableMetrics bool
 }
 
-func NewServer(manager *Manager, verifier *auth.Verifier, m *metrics.Metrics, logger *zap.Logger) *Server {
+func NewServer(manager *Manager, verifier *auth.Verifier, m *metrics.Metrics, logger *zap.Logger, enableMetrics bool) *Server {
 	s := &Server{
 		manager:  manager,
 		verifier: verifier,
 		metrics:  m,
 		logger:   logger,
 		mux:      http.NewServeMux(),
+		enableMetrics: enableMetrics,
 	}
 	s.routes()
 	return s
 }
 
 func (s *Server) routes() {
-	s.mux.Handle("/metrics", s.metrics.Handler())
+	if s.enableMetrics {
+		s.mux.Handle("/metrics", s.metrics.Handler())
+	}
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))

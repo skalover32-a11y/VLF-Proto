@@ -62,11 +62,24 @@ type AuthConfig struct {
 	ReplayTTL Duration `yaml:"replay_ttl"`
 }
 
+type TransportConfig struct {
+	ProfilesEnabled  bool     `yaml:"transport_profiles_enabled"`
+	ScoringEnabled   bool     `yaml:"profile_scoring_enabled"`
+	MigrationEnabled bool     `yaml:"profile_migration_enabled"`
+	ResumeEnabled    bool     `yaml:"resume_tokens_enabled"`
+	DefaultProfile   string   `yaml:"default_transport_profile"`
+	ResumeSecret     string   `yaml:"resume_secret"`
+	ResumeTokenTTL   Duration `yaml:"resume_token_ttl"`
+	ResumeReplayTTL  Duration `yaml:"resume_replay_ttl"`
+	ResumeEpochTTL   Duration `yaml:"resume_epoch_ttl"`
+}
+
 type Config struct {
 	ListenHTTP        string            `yaml:"listen_http"`
 	ListenQUIC        string            `yaml:"listen_quic"`
 	ListenTCP         string            `yaml:"listen_tcp"`
 	AllowInsecureHTTP bool              `yaml:"allow_insecure_http"`
+	EnableMetrics     bool              `yaml:"enable_metrics"`
 	ProtocolID        string            `yaml:"protocol_id"`
 	LogLevel          string            `yaml:"log_level"`
 	MaxDgramPayload   int               `yaml:"max_dgram_payload"`
@@ -75,6 +88,7 @@ type Config struct {
 	Limits            LimitsConfig      `yaml:"limits"`
 	Timeouts          TimeoutsConfig    `yaml:"timeouts"`
 	Auth              AuthConfig        `yaml:"auth"`
+	Transport         TransportConfig   `yaml:"transport"`
 }
 
 func Default() *Config {
@@ -83,6 +97,7 @@ func Default() *Config {
 		ListenQUIC:        ":443",
 		ListenTCP:         ":443",
 		AllowInsecureHTTP: true,
+		EnableMetrics:     true,
 		ProtocolID:        "vlf-runtime/0.1",
 		LogLevel:          "info",
 		MaxDgramPayload:   1200,
@@ -116,6 +131,16 @@ func Default() *Config {
 		Auth: AuthConfig{
 			ClockSkew: Duration{Duration: 60 * time.Second},
 			ReplayTTL: Duration{Duration: 60 * time.Second},
+		},
+		Transport: TransportConfig{
+			ProfilesEnabled:  false,
+			ScoringEnabled:   false,
+			MigrationEnabled: false,
+			ResumeEnabled:    false,
+			DefaultProfile:   "balanced",
+			ResumeTokenTTL:   Duration{Duration: 2 * time.Minute},
+			ResumeReplayTTL:  Duration{Duration: 2 * time.Minute},
+			ResumeEpochTTL:   Duration{Duration: 15 * time.Minute},
 		},
 	}
 }
@@ -221,6 +246,19 @@ func (c *Config) applyDefaults() {
 	if c.Auth.ReplayTTL.Duration == 0 {
 		c.Auth.ReplayTTL = def.Auth.ReplayTTL
 	}
+
+	if c.Transport.DefaultProfile == "" {
+		c.Transport.DefaultProfile = def.Transport.DefaultProfile
+	}
+	if c.Transport.ResumeTokenTTL.Duration == 0 {
+		c.Transport.ResumeTokenTTL = def.Transport.ResumeTokenTTL
+	}
+	if c.Transport.ResumeReplayTTL.Duration == 0 {
+		c.Transport.ResumeReplayTTL = def.Transport.ResumeReplayTTL
+	}
+	if c.Transport.ResumeEpochTTL.Duration == 0 {
+		c.Transport.ResumeEpochTTL = def.Transport.ResumeEpochTTL
+	}
 }
 
 func (c *Config) Validate() error {
@@ -256,6 +294,18 @@ func (c *Config) Validate() error {
 	}
 	if c.Auth.ReplayTTL.Duration <= 0 {
 		return errors.New("auth.replay_ttl must be > 0")
+	}
+	if c.Transport.ResumeEnabled && c.Transport.ResumeSecret == "" {
+		return errors.New("transport.resume_secret is required when resume_tokens_enabled=true")
+	}
+	if c.Transport.ResumeEnabled && c.Transport.ResumeTokenTTL.Duration <= 0 {
+		return errors.New("transport.resume_token_ttl must be > 0")
+	}
+	if c.Transport.ResumeEnabled && c.Transport.ResumeReplayTTL.Duration <= 0 {
+		return errors.New("transport.resume_replay_ttl must be > 0")
+	}
+	if c.Transport.ResumeEnabled && c.Transport.ResumeEpochTTL.Duration <= 0 {
+		return errors.New("transport.resume_epoch_ttl must be > 0")
 	}
 	return nil
 }

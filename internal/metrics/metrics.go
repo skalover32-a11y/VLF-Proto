@@ -19,25 +19,36 @@ type Config struct {
 type Metrics struct {
 	registry *prometheus.Registry
 
-	ActiveSessions   prometheus.Gauge
-	ActiveRelayConns prometheus.Gauge
-	BytesIn          *prometheus.CounterVec
-	BytesOut         *prometheus.CounterVec
-	UDPPackets       prometheus.Counter
-	UDPForwarded     prometheus.Counter
-	UDPDstRX         prometheus.Counter
-	UDPToClient      prometheus.Counter
-	UDPToClientFail  prometheus.Counter
-	UDPPPS           prometheus.Gauge
-	RecvDatagrams    prometheus.Counter
-	RecvBytes        prometheus.Counter
-	DroppedDatagrams *prometheus.CounterVec
-	DatagramProcPPS  prometheus.Gauge
-	DatagramQueueLen prometheus.Gauge
-	TCPStreams       prometheus.Gauge
-	AuthFailures     prometheus.Counter
-	ReplayDrops      prometheus.Counter
-	OpenFailures     *prometheus.CounterVec
+	ActiveSessions             prometheus.Gauge
+	ActiveRelayConns           prometheus.Gauge
+	BytesIn                    *prometheus.CounterVec
+	BytesOut                   *prometheus.CounterVec
+	UDPPackets                 prometheus.Counter
+	UDPForwarded               prometheus.Counter
+	UDPDstRX                   prometheus.Counter
+	UDPToClient                prometheus.Counter
+	UDPToClientFail            prometheus.Counter
+	UDPPPS                     prometheus.Gauge
+	RecvDatagrams              prometheus.Counter
+	RecvBytes                  prometheus.Counter
+	DroppedDatagrams           *prometheus.CounterVec
+	DatagramProcPPS            prometheus.Gauge
+	DatagramQueueLen           prometheus.Gauge
+	TCPStreams                 prometheus.Gauge
+	AuthFailures               prometheus.Counter
+	ReplayDrops                prometheus.Counter
+	OpenFailures               *prometheus.CounterVec
+	ActiveProfile              *prometheus.GaugeVec
+	ProfileSwitchAttempts      *prometheus.CounterVec
+	ProfileSwitchSuccess       *prometheus.CounterVec
+	ProfileSwitchRevert        *prometheus.CounterVec
+	ProfileSwitchCooldownSkips *prometheus.CounterVec
+	ProfileDegradationEvents   *prometheus.CounterVec
+	ResumeAttempts             *prometheus.CounterVec
+	ResumeSuccess              *prometheus.CounterVec
+	ResumeReject               *prometheus.CounterVec
+	ResumeReplayReject         *prometheus.CounterVec
+	ResumeExpiredReject        *prometheus.CounterVec
 
 	udpPacketsSecond       atomic.Uint64
 	datagramProcSecond     atomic.Uint64
@@ -140,6 +151,50 @@ func NewWithConfig(cfg Config) *Metrics {
 			Name: "vlf_open_failures_total",
 			Help: "Open failures by lane and reason",
 		}, []string{"lane", "reason"}),
+		ActiveProfile: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "vlf_transport_profile_active",
+			Help: "Active transport profile gauge by profile, path family, and role",
+		}, []string{"profile", "path_family", "role"}),
+		ProfileSwitchAttempts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vlf_profile_switch_attempts_total",
+			Help: "Transport profile switch attempts by profile, path family, and role",
+		}, []string{"profile", "path_family", "role"}),
+		ProfileSwitchSuccess: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vlf_profile_switch_success_total",
+			Help: "Transport profile switch successes by profile, path family, and role",
+		}, []string{"profile", "path_family", "role"}),
+		ProfileSwitchRevert: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vlf_profile_switch_revert_total",
+			Help: "Transport profile switch reverts by profile, path family, and role",
+		}, []string{"profile", "path_family", "role"}),
+		ProfileSwitchCooldownSkips: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vlf_profile_switch_cooldown_skips_total",
+			Help: "Transport profile switch skips due to cooldown by profile, path family, and role",
+		}, []string{"profile", "path_family", "role"}),
+		ProfileDegradationEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vlf_profile_degradation_events_total",
+			Help: "Transport profile degradation events by reason, path family, and role",
+		}, []string{"reason", "path_family", "role"}),
+		ResumeAttempts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vlf_resume_attempts_total",
+			Help: "Resume token validation attempts by path family and role",
+		}, []string{"path_family", "role"}),
+		ResumeSuccess: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vlf_resume_success_total",
+			Help: "Resume token validation successes by path family and role",
+		}, []string{"path_family", "role"}),
+		ResumeReject: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vlf_resume_reject_total",
+			Help: "Resume token generic rejects by path family and role",
+		}, []string{"path_family", "role"}),
+		ResumeReplayReject: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vlf_resume_replay_reject_total",
+			Help: "Resume token replay rejects by path family and role",
+		}, []string{"path_family", "role"}),
+		ResumeExpiredReject: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vlf_resume_expired_reject_total",
+			Help: "Resume token expired rejects by path family and role",
+		}, []string{"path_family", "role"}),
 		udpPPSHoldWindow: cfg.UDPPPSHoldWindow,
 		ppsTickInterval:  cfg.PPSTickInterval,
 		nowFn:            cfg.Now,
@@ -166,6 +221,17 @@ func NewWithConfig(cfg Config) *Metrics {
 		m.AuthFailures,
 		m.ReplayDrops,
 		m.OpenFailures,
+		m.ActiveProfile,
+		m.ProfileSwitchAttempts,
+		m.ProfileSwitchSuccess,
+		m.ProfileSwitchRevert,
+		m.ProfileSwitchCooldownSkips,
+		m.ProfileDegradationEvents,
+		m.ResumeAttempts,
+		m.ResumeSuccess,
+		m.ResumeReject,
+		m.ResumeReplayReject,
+		m.ResumeExpiredReject,
 	)
 
 	go m.ppsLoop()

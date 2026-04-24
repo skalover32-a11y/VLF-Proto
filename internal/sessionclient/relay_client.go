@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"vlf-runtime/internal/auth"
+	"vlf-runtime/internal/transport/health"
+	"vlf-runtime/internal/transport/profile"
 )
 
 type relayClient struct {
@@ -105,6 +107,25 @@ func (c *relayClient) leaseState() (SessionLease, bool) {
 
 func (c *relayClient) unusableState() (SessionUnusableState, bool) {
 	return SessionUnusableState{}, false
+}
+
+func (c *relayClient) activeProfile() string {
+	return profile.ProfileBalanced
+}
+
+func (c *relayClient) healthSnapshot() (health.Snapshot, bool) {
+	return health.Snapshot{}, false
+}
+
+func (c *relayClient) applyTransportProfile(_ context.Context, _ string) error {
+	return nil
+}
+
+func (c *relayClient) debugSnapshot() (DebugSnapshot, bool) {
+	return DebugSnapshot{
+		ActiveProfile: profile.ProfileBalanced,
+		ResumePath:    ResumePathFullAuth,
+	}, true
 }
 
 func (f *relayTCPFlow) ID() uint64 {

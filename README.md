@@ -91,6 +91,42 @@ Update deployed gateway:
 sudo bash /opt/vlf-proto/scripts/update.sh --ref main
 ```
 
+Deploy or update from automation/panel using the same entrypoint:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/main/scripts/update.sh | sudo bash -s -- --ref main
+```
+
+`update.sh` is now deploy-friendly:
+
+- if gateway is already installed, it performs an in-place update
+- if gateway is missing or installation is partial, it bootstraps `install.sh`
+- install-only flags such as `--domain`, `--port-*`, `--ufw`, `--client-id`, `--secret` are forwarded only during bootstrap install
+- on an already installed host those install-only flags are ignored with a warning, so a panel can safely reuse the same command template
+- when a legacy host falls back to `install.sh --force`, the installer preserves the existing runtime config and TLS cert/key by default instead of rewriting them blindly
+- use `--regenerate-cert` only when you intentionally want to replace the current TLS cert/key on an existing host
+
+Example panel/automation command for bootstrap-or-update:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/main/scripts/update.sh | sudo bash -s -- \
+  --ref main \
+  --domain your.domain.tld \
+  --tls-server-name your.domain.tld \
+  --port-tcp 443 \
+  --port-udp 443 \
+  --port-udp-alt 8443 \
+  --metrics-addr 127.0.0.1 \
+  --metrics-port 8080 \
+  --ufw
+```
+
+Strict update-only mode (fail if install is missing):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/skalover32-a11y/VLF-Proto/main/scripts/update.sh | sudo bash -s -- --ref main --no-bootstrap
+```
+
 Uninstall gateway:
 
 ```bash
@@ -293,14 +329,16 @@ Minimal Windows `.env` example (`scripts/.env`):
 
 ```dotenv
 MODE=External
-GATEWAY_HOST=troynichek-live.ru
+GATEWAY_HOST=example.com
 GATEWAY_PORT_UDP=8443
 GATEWAY_PORT_TCP=443
-RELAY_BASE=http://troynichek-live.ru:8080
+RELAY_BASE=http://example.com:8080
 VLF_CLIENT_ID=smoke-client
 VLF_SECRET=smoke-secret
 # or: VLF_SECRET=b64:c21va2Utc2VjcmV0
 VLF_PIN_SPKI=
+# Production clients should set both values; VLF_PRODUCTION=1 fails fast if the pin is missing.
+VLF_PRODUCTION=0
 BUILD=1
 ```
 
@@ -466,8 +504,8 @@ One-window runner (Windows, combined logs for analysis):
 
 ```powershell
 .\scripts\run-vlf-stack.ps1 `
-  -GatewayHost troynichek-live.ru `
-  -GatewayIP 5.180.46.33 `
+  -GatewayHost example.com `
+  -GatewayIP 203.0.113.10 `
   -SingBoxConfig .\config.json
 ```
 
@@ -816,6 +854,146 @@ Key fields:
 - `limits.*`
 - `timeouts.relay_idle`, `timeouts.session_idle`, `timeouts.dial_timeout`
 - `max_dgram_payload`
+
+### Transport profiles / scoring / migration / resume flags
+
+New transport evolution features are gated and disabled by default. This keeps the legacy session behavior intact until you explicitly roll them out.
+
+Gateway YAML flags:
+
+- `transport.transport_profiles_enabled`
+- `transport.profile_scoring_enabled`
+- `transport.profile_migration_enabled`
+- `transport.resume_tokens_enabled`
+- `transport.default_transport_profile`
+- `transport.resume_secret`
+- `transport.resume_token_ttl`
+- `transport.resume_replay_ttl`
+- `transport.resume_epoch_ttl`
+
+Client env flags:
+
+- `VLF_TRANSPORT_PROFILES_ENABLED=1`
+- `VLF_PROFILE_SCORING_ENABLED=1`
+- `VLF_PROFILE_MIGRATION_ENABLED=1`
+- `VLF_RESUME_TOKENS_ENABLED=1`
+- `VLF_TRANSPORT_PROFILE=balanced|low_observable|survival`
+
+Rollout order:
+
+1. Enable `transport_profiles_enabled` first.
+2. Enable `profile_scoring_enabled` after validating logs and active profile metrics.
+3. Enable `profile_migration_enabled` only after score/debug output looks sane.
+4. Enable `resume_tokens_enabled` last, with a dedicated `transport.resume_secret`.
+
+For the production canary sequence and rollback criteria, see `docs/canary-rollout.md`.
+
+The current default profiles are:
+
+- `balanced`
+- `low_observable`
+- `survival`
+
+Server metrics added for these features include:
+
+- `vlf_transport_profile_active{profile,path_family,role}`
+- `vlf_profile_switch_attempts_total{profile,path_family,role}`
+- `vlf_profile_switch_success_total{profile,path_family,role}`
+- `vlf_resume_attempts_total{path_family,role}`
+- `vlf_resume_success_total{path_family,role}`
+- `vlf_resume_reject_total{path_family,role}`
+- `vlf_resume_replay_reject_total{path_family,role}`
+- `vlf_resume_expired_reject_total{path_family,role}`
+
+### Mixed-fleet compatibility matrix
+
+The new transport evolution layer is guarded so mixed rollouts stay on the legacy path when the peer does not support newer behavior.
+
+Safe combinations currently covered by tests:
+
+- old client -> new server:
+  - server only appends `AUTH_OK` optional tail when the client advertised profile/resume support in `AUTH`
+  - legacy clients continue receiving the fixed `AUTH_OK` payload
+- new client -> old server:
+  - client first attempts extended `AUTH`
+  - if peer rejects the optional tail (`invalid AUTH payload`), client performs one clean legacy re-dial
+  - no reconnect loop; fallback is single-shot
+- new client with profiles only:
+  - profile id in `AUTH` is optional
+  - if peer supports profiles, negotiated profile is applied
+  - if peer is legacy, client falls back to legacy auth and continues without mandatory `PROFILE_*` frames
+- new client with profiles + scoring but migration disabled:
+  - health scoring remains local-only
+  - no profile migration loop is started
+  - no dependency on `PROFILE_SET/PROFILE_OK/PROFILE_FAIL`
+- new client with resume enabled -> server without resume:
+  - optional resume material in `AUTH` is accepted or ignored safely
+  - client stays on full-auth path if peer does not confirm resume state in `AUTH_OK`
+- profile migration enabled -> peer without migration support:
+  - first `PROFILE_SET` failure marks peer as unsupported
+  - next migration attempts fail fast locally instead of re-sending control frames forever
+
+Unsupported-feature behavior is explicit:
+
+- `transport_feature_fallback ... feature=profiles_resume mode=legacy_auth`
+- `transport_feature_fallback ... feature=resume_tokens mode=full_auth`
+- `transport_feature_fallback ... feature=profile_migration ...`
+
+This is the intended rollout contract:
+
+- profiles/scoring may be enabled before migration
+- migration may be enabled before resume
+- any unsupported peer falls back to the legacy session path instead of hanging or oscillating
+
+The compatibility harness covers both session transports:
+
+- TCP session mixed-peer cases
+- QUIC mixed-peer cases
+
+QUIC-specific checks additionally verify:
+
+- one-shot legacy auth fallback without reconnect spam
+- profile migration unsupported state is remembered after the first `PROFILE_FAIL`
+- resume attempts without server confirmation stay on `full_auth`
+
+### Client debug state
+
+Client-side observability is available without Prometheus on the client runtime:
+
+- `sessionclient.Client.DebugSnapshot()`
+- `sessionclient.Client.DebugDumpJSON()`
+
+Snapshot fields include:
+
+- active profile
+- health score
+- degradation level
+- degradation reason flags
+- migration attempts / successes / reverts
+- migration cooldown state
+- resume path (`full_auth`, `resume_fast_path`, `legacy_fallback`)
+- legacy peer fallback state
+- profile-migration unsupported state
+- time spent per profile
+
+This surface is stable enough for Windows/Android debug UI, CLI dumps, or structured support logs without exposing server-only metrics endpoints.
+
+Optional support CLI dump:
+
+```bash
+go run ./cmd/session_debug_dump --transport quic --probe
+```
+
+Useful flags:
+
+- `--transport auto|quic|tcp`
+- `--profiles`
+- `--scoring`
+- `--migration`
+- `--resume`
+- `--profile balanced|low_observable|survival`
+
+The command only dials once, optionally sends one RTT probe, prints `DebugDumpJSON()`, and exits. It does not change the normal runtime path of SOCKS/TUN clients.
 
 Optional env overrides:
 

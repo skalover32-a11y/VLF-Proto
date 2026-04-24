@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"vlf-runtime/internal/auth"
+	"vlf-runtime/internal/transport/profile"
+	"vlf-runtime/internal/transport/resume"
 )
 
 type Config struct {
@@ -43,6 +45,15 @@ type Config struct {
 	AllowRelay        bool
 	ForceIPv4         bool
 	Debug             bool
+	Production        bool
+
+	TransportProfilesEnabled bool
+	ProfileScoringEnabled    bool
+	ProfileMigrationEnabled  bool
+	ResumeTokensEnabled      bool
+	TransportProfileID       string
+	ProfileRegistry          *profile.Registry
+	ResumeStore              resume.Store
 }
 
 var defaultProtoIDCompat = []string{
@@ -105,15 +116,28 @@ func LoadConfigFromEnv() (Config, error) {
 		PinSPKI:         pin,
 		TLSServerName:   tlsServerName,
 
-		MaxDgramPayload:   envOrInt("MAX_DGRAM_PAYLOAD", 1200),
-		QUICTimeout:       time.Duration(envOrInt("QUIC_CONNECT_TIMEOUT_MS", 1800)) * time.Millisecond,
-		TCPTimeout:        time.Duration(envOrInt("TCP_CONNECT_TIMEOUT_MS", 1800)) * time.Millisecond,
-		PreferQUIC:        envBool("VLF_PREFER_QUIC", true),
-		DisableQUIC:       envBool("VLF_DISABLE_QUIC", false),
-		DisableTCPSession: envBool("VLF_DISABLE_TCP_SESSION", false),
-		AllowRelay:        !envBool("VLF_DISABLE_RELAY_FALLBACK", false),
-		ForceIPv4:         envBool("VLF_FORCE_IPV4", false),
-		Debug:             envBool("VLF_DEBUG", false),
+		MaxDgramPayload:          envOrInt("MAX_DGRAM_PAYLOAD", 1200),
+		QUICTimeout:              time.Duration(envOrInt("QUIC_CONNECT_TIMEOUT_MS", 1800)) * time.Millisecond,
+		TCPTimeout:               time.Duration(envOrInt("TCP_CONNECT_TIMEOUT_MS", 1800)) * time.Millisecond,
+		PreferQUIC:               envBool("VLF_PREFER_QUIC", true),
+		DisableQUIC:              envBool("VLF_DISABLE_QUIC", false),
+		DisableTCPSession:        envBool("VLF_DISABLE_TCP_SESSION", false),
+		AllowRelay:               !envBool("VLF_DISABLE_RELAY_FALLBACK", false),
+		ForceIPv4:                envBool("VLF_FORCE_IPV4", false),
+		Debug:                    envBool("VLF_DEBUG", false),
+		Production:               envBool("VLF_PRODUCTION", false) || envBool("VLF_REQUIRE_SPKI_PIN", false),
+		TransportProfilesEnabled: envBool("VLF_TRANSPORT_PROFILES_ENABLED", false),
+		ProfileScoringEnabled:    envBool("VLF_PROFILE_SCORING_ENABLED", false),
+		ProfileMigrationEnabled:  envBool("VLF_PROFILE_MIGRATION_ENABLED", false),
+		ResumeTokensEnabled:      envBool("VLF_RESUME_TOKENS_ENABLED", false),
+		TransportProfileID:       envOr("VLF_TRANSPORT_PROFILE", profile.ProfileBalanced),
+	}
+
+	if cfg.ProfileRegistry == nil {
+		cfg.ProfileRegistry = profile.DefaultRegistry()
+	}
+	if cfg.ResumeTokensEnabled && cfg.ResumeStore == nil {
+		cfg.ResumeStore = resume.NewMemoryStore()
 	}
 
 	if cfg.QUICTimeout < 500*time.Millisecond {
@@ -164,6 +188,9 @@ func (c Config) TLSConfig() (*tls.Config, error) {
 	}
 
 	if strings.TrimSpace(c.PinSPKI) == "" {
+		if c.Production {
+			return nil, errors.New("production TLS policy requires VLF_PIN_SPKI")
+		}
 		return tlsConf, nil
 	}
 

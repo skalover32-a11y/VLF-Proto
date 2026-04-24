@@ -9,13 +9,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"vlf-runtime/internal/auth"
 	"vlf-runtime/internal/session"
+	"vlf-runtime/internal/transport/health"
+	"vlf-runtime/internal/transport/migration"
+	"vlf-runtime/internal/transport/profile"
+	"vlf-runtime/internal/transport/resume"
 )
 
 type tcpSessionClient struct {
@@ -31,14 +37,28 @@ type tcpSessionClient struct {
 	flowMu sync.RWMutex
 	flows  map[uint64]*tcpFramedFlow
 
-	pendingMu   sync.Mutex
-	pendingTCP  map[uint64]chan openResult
-	pendingUDP  map[uint64]chan openResult
-	pendingPing map[string]chan error
+	pendingMu      sync.Mutex
+	pendingTCP     map[uint64]chan openResult
+	pendingUDP     map[uint64]chan openResult
+	pendingPing    map[string]chan error
+	pendingProfile chan openResult
 
 	leaseMu  sync.RWMutex
 	lease    SessionLease
 	hasLease bool
+
+	profileRegistry     *profile.Registry
+	profileMu           sync.RWMutex
+	currentProfileState profile.TransportProfile
+
+	healthMu      sync.RWMutex
+	healthEngine  *health.Engine
+	lastRTTMs     float64
+	hasRTTSample  bool
+	scheduler     *migration.Scheduler
+	resumeKey     string
+	resumeAttempt bool
+	debugState    clientDebugState
 
 	unusableMu sync.RWMutex
 	unusable   SessionUnusableState
@@ -47,8 +67,9 @@ type tcpSessionClient struct {
 }
 
 type openResult struct {
-	ok  bool
-	err error
+	ok        bool
+	err       error
+	profileID string
 }
 
 type tcpFramedFlow struct {
@@ -65,6 +86,25 @@ type tcpFramedFlow struct {
 }
 
 func dialTCPSession(ctx context.Context, cfg Config) (*tcpSessionClient, error) {
+	useExtendedAuth := cfg.TransportProfilesEnabled || cfg.ResumeTokensEnabled
+	client, err := dialTCPSessionAttempt(ctx, cfg, useExtendedAuth)
+	if err == nil {
+		return client, nil
+	}
+	if useExtendedAuth && errors.Is(err, errLegacyPeerAuthUnsupported) {
+		debugf(cfg, "auth_fallback_to_legacy transport=tcp-session reason=legacy_peer_rejected_extended_auth")
+		client, legacyErr := dialTCPSessionAttempt(ctx, cfg, false)
+		if legacyErr != nil {
+			return nil, legacyErr
+		}
+		client.debugState.markLegacyFallback("legacy peer rejected extended auth")
+		debugf(cfg, "transport_feature_fallback transport=tcp-session feature=profiles_resume mode=legacy_auth")
+		return client, nil
+	}
+	return nil, err
+}
+
+func dialTCPSessionAttempt(ctx context.Context, cfg Config, useExtendedAuth bool) (*tcpSessionClient, error) {
 	tlsConf, err := cfg.TLSConfig()
 	if err != nil {
 		return nil, err
@@ -80,25 +120,42 @@ func dialTCPSession(ctx context.Context, cfg Config) (*tcpSessionClient, error) 
 	}
 
 	clientCtx, cancelClient := context.WithCancel(context.Background())
+	reg := cfg.ProfileRegistry
+	if reg == nil {
+		reg = profile.DefaultRegistry()
+	}
 	c := &tcpSessionClient{
-		cfg:         cfg,
-		conn:        conn,
-		reader:      bufio.NewReader(conn),
-		ctx:         clientCtx,
-		cancel:      cancelClient,
-		flows:       make(map[uint64]*tcpFramedFlow),
-		pendingTCP:  make(map[uint64]chan openResult),
-		pendingUDP:  make(map[uint64]chan openResult),
-		pendingPing: make(map[string]chan error),
+		cfg:                 cfg,
+		conn:                conn,
+		reader:              bufio.NewReader(conn),
+		ctx:                 clientCtx,
+		cancel:              cancelClient,
+		flows:               make(map[uint64]*tcpFramedFlow),
+		pendingTCP:          make(map[uint64]chan openResult),
+		pendingUDP:          make(map[uint64]chan openResult),
+		pendingPing:         make(map[string]chan error),
+		profileRegistry:     reg,
+		currentProfileState: reg.MustGetOrDefault(cfg.TransportProfileID),
+		resumeKey:           resume.Key(firstNonEmpty(cfg.GatewayHost, cfg.GatewayDialHost), cfg.ClientID),
+	}
+	c.debugState.init(c.currentProfileState.ID, time.Now())
+	if cfg.ProfileScoringEnabled {
+		c.healthEngine = health.NewEngine(health.Config{})
+	}
+	if cfg.ProfileMigrationEnabled && cfg.TransportProfilesEnabled {
+		c.scheduler = migration.NewScheduler(migration.Config{}, reg)
 	}
 
-	if err := c.auth(ctx); err != nil {
+	if err := c.auth(ctx, useExtendedAuth); err != nil {
 		cancelClient()
 		_ = conn.Close()
 		return nil, err
 	}
 
 	go c.readLoop()
+	if c.scheduler != nil && c.healthEngine != nil {
+		go c.migrationLoop()
+	}
 	return c, nil
 }
 
@@ -168,7 +225,7 @@ func dialTCPTLS(ctx context.Context, cfg Config, tlsConf *tls.Config) (net.Conn,
 	return nil, lastErr
 }
 
-func (c *tcpSessionClient) auth(ctx context.Context) error {
+func (c *tcpSessionClient) auth(ctx context.Context, useExtendedAuth bool) error {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
 		return wrapErr("nonce generation", err)
@@ -177,14 +234,26 @@ func (c *tcpSessionClient) auth(ctx context.Context) error {
 	ts := uint64(time.Now().UnixMilli())
 	caps := uint64(0b0011)
 	sig := signSession(c.cfg.Secret, auth.SessionAuthMaterial(c.cfg.ClientID, ts, nonce, caps))
-
-	payload := session.EncodeAuthPayload(session.AuthPayload{
+	authPayload := session.AuthPayload{
 		ClientID: c.cfg.ClientID,
 		TSMS:     ts,
 		Nonce:    nonce,
 		Sig:      sig,
 		Caps:     caps,
-	})
+	}
+	if useExtendedAuth && c.cfg.TransportProfilesEnabled {
+		authPayload.ProfileID = c.activeProfileID()
+	}
+	if useExtendedAuth && c.cfg.ResumeTokensEnabled && c.cfg.ResumeStore != nil {
+		if state, ok := c.cfg.ResumeStore.Load(c.resumeKey); ok && state.ExpiresAt.After(time.Now()) {
+			authPayload.ResumeTag = append([]byte(nil), state.Tag...)
+			authPayload.ResumeToken = append([]byte(nil), state.Token...)
+			c.resumeAttempt = true
+		}
+	}
+	c.debugState.setResumePath(ResumePathFullAuth)
+
+	payload := session.EncodeAuthPayload(authPayload)
 
 	if err := c.writeFrame(session.FrameAUTH, payload); err != nil {
 		return wrapErr("write AUTH", err)
@@ -199,8 +268,13 @@ func (c *tcpSessionClient) auth(ctx context.Context) error {
 	}
 
 	if frame.Type == session.FrameAUTHFAIL {
+		reason := decodeAuthFailReason(frame.Payload)
+		if useExtendedAuth && isLegacyAuthUnsupportedReason(reason) {
+			return errLegacyPeerAuthUnsupported
+		}
 		c.setUnusableReason("auth_failed", time.Now())
-		return fmt.Errorf("AUTH failed: %s", decodeAuthFailReason(frame.Payload))
+		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "tcp-session", IdleResumeFailure: c.resumeAttempt})
+		return fmt.Errorf("AUTH failed: %s", reason)
 	}
 	if frame.Type != session.FrameAUTHOK {
 		return fmt.Errorf("expected AUTH_OK, got %d", frame.Type)
@@ -210,6 +284,16 @@ func (c *tcpSessionClient) auth(ctx context.Context) error {
 		return wrapErr("decode AUTH_OK", err)
 	}
 	c.storeAuthLease(authOK, time.Now())
+	c.applyAuthOKProfile(authOK.ProfileID)
+	resumeAccepted := c.storeResumeState(authOK)
+	if c.resumeAttempt {
+		if resumeAccepted {
+			c.debugState.setResumePath(ResumePathResumeFastPath)
+			c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "tcp-session", IdleResumeSuccess: true})
+		} else {
+			debugf(c.cfg, "transport_feature_fallback transport=tcp-session feature=resume_tokens mode=full_auth reason=peer_did_not_confirm_resume")
+		}
+	}
 	return nil
 }
 
@@ -236,12 +320,15 @@ func (c *tcpSessionClient) openTCPFlow(ctx context.Context, flowID uint64, dstHo
 	case out := <-respCh:
 		if !out.ok {
 			if out.err != nil {
+				c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "tcp-session", TimeoutRate: 1, RecoveryEvent: true})
 				return nil, out.err
 			}
 			return nil, errors.New("OPEN_TCP failed")
 		}
+		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "tcp-session"})
 	case <-waitCtx.Done():
 		c.unregisterPendingTCP(flowID)
+		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "tcp-session", TimeoutRate: 1, RecoveryEvent: true})
 		return nil, waitCtx.Err()
 	}
 
@@ -281,6 +368,7 @@ func (c *tcpSessionClient) openUDPFlow(ctx context.Context, flowID uint64, dstHo
 	case out := <-respCh:
 		if !out.ok {
 			if out.err != nil {
+				c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "tcp-session", TimeoutRate: 1, RecoveryEvent: true})
 				return nil, out.err
 			}
 			return nil, errors.New("OPEN_UDP failed")
@@ -288,7 +376,139 @@ func (c *tcpSessionClient) openUDPFlow(ctx context.Context, flowID uint64, dstHo
 		return nil, errors.New("udp on tcp transport is not supported")
 	case <-waitCtx.Done():
 		c.unregisterPendingUDP(flowID)
+		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "tcp-session", TimeoutRate: 1, RecoveryEvent: true})
 		return nil, waitCtx.Err()
+	}
+}
+
+func (c *tcpSessionClient) activeProfile() string {
+	return c.activeProfileID()
+}
+
+func (c *tcpSessionClient) activeProfileID() string {
+	c.profileMu.RLock()
+	defer c.profileMu.RUnlock()
+	return c.currentProfileState.ID
+}
+
+func (c *tcpSessionClient) currentProfile() profile.TransportProfile {
+	c.profileMu.RLock()
+	defer c.profileMu.RUnlock()
+	return c.currentProfileState
+}
+
+func (c *tcpSessionClient) setActiveProfileByID(id string) profile.TransportProfile {
+	next := c.profileRegistry.MustGetOrDefault(id)
+	c.profileMu.Lock()
+	c.currentProfileState = next
+	c.profileMu.Unlock()
+	return next
+}
+
+func (c *tcpSessionClient) applyAuthOKProfile(id string) {
+	if !c.cfg.TransportProfilesEnabled || id == "" {
+		return
+	}
+	applied := c.setActiveProfileByID(id)
+	c.debugState.noteProfile(applied.ID, time.Now())
+	debugf(c.cfg, "transport_profile_applied transport=tcp-session profile_id=%s reason=auth_ok", applied.ID)
+}
+
+func (c *tcpSessionClient) healthSnapshot() (health.Snapshot, bool) {
+	c.healthMu.RLock()
+	engine := c.healthEngine
+	c.healthMu.RUnlock()
+	if engine == nil {
+		return health.Snapshot{}, false
+	}
+	return engine.Evaluate(time.Now()), true
+}
+
+func (c *tcpSessionClient) debugSnapshot() (DebugSnapshot, bool) {
+	now := time.Now()
+	snapshot := c.debugState.snapshot(now)
+	snapshot.ActiveProfile = c.activeProfileID()
+	if lease, ok := c.leaseState(); ok {
+		snapshot.SessionLease = lease
+		snapshot.HasSessionLease = true
+	}
+	if unusable, ok := c.unusableState(); ok {
+		snapshot.SessionUnusable = unusable
+		snapshot.HasSessionUnusable = true
+	}
+	if healthSnap, ok := c.healthSnapshot(); ok {
+		snapshot.HealthScore = healthSnap.Score
+		snapshot.DegradationLevel = healthSnap.Level
+		snapshot.DegradationReasonFlags = append([]health.ReasonFlag(nil), healthSnap.Flags...)
+	}
+	if c.scheduler != nil {
+		sched := c.scheduler.Snapshot(now)
+		snapshot.MigrationCooldownRemaining = sched.CooldownRemaining
+		snapshot.MigrationCooldownActive = sched.CooldownRemaining > 0
+	}
+	return snapshot, true
+}
+
+func (c *tcpSessionClient) ApplyTransportProfile(ctx context.Context, profileID string) error {
+	return c.applyTransportProfile(ctx, profileID)
+}
+
+func (c *tcpSessionClient) applyTransportProfile(ctx context.Context, profileID string) error {
+	if !c.cfg.TransportProfilesEnabled {
+		return nil
+	}
+	next, ok := c.profileRegistry.Get(profileID)
+	if !ok {
+		return fmt.Errorf("unknown transport profile %q", profileID)
+	}
+	if next.ID == c.activeProfileID() {
+		return nil
+	}
+	if !c.cfg.ProfileMigrationEnabled {
+		c.setActiveProfileByID(next.ID)
+		c.debugState.noteProfile(next.ID, time.Now())
+		return nil
+	}
+	if unsupported, reason := c.debugState.profileSwitchUnsupportedState(); unsupported {
+		debugf(c.cfg, "transport_feature_fallback transport=tcp-session feature=profile_migration requested=%s active=%s reason=%s", next.ID, c.activeProfileID(), reason)
+		return ErrProfileSwitchUnsupported
+	}
+
+	c.debugState.noteMigrationAttempt("apply_transport_profile", time.Now())
+	respCh, err := c.registerPendingProfile()
+	if err != nil {
+		return err
+	}
+	if err := c.writeFrame(session.FramePROFILESET, session.EncodeProfilePayload(session.ProfilePayload{ProfileID: next.ID})); err != nil {
+		c.unregisterPendingProfile()
+		return wrapErr("write profile switch", err)
+	}
+
+	waitCtx, cancel := expectTimeout(ctx, 4*time.Second)
+	defer cancel()
+	select {
+	case out, ok := <-respCh:
+		if !ok {
+			return io.EOF
+		}
+		if out.err != nil {
+			if errors.Is(out.err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(out.err.Error()), "migration disabled") {
+				c.debugState.markProfileSwitchUnsupported(out.err.Error())
+				debugf(c.cfg, "transport_feature_fallback transport=tcp-session feature=profile_migration requested=%s reason=%s", next.ID, out.err)
+				return fmt.Errorf("%w: %s", ErrProfileSwitchUnsupported, out.err)
+			}
+			return out.err
+		}
+		applied := c.setActiveProfileByID(firstNonEmpty(out.profileID, next.ID))
+		c.debugState.noteProfile(applied.ID, time.Now())
+		c.debugState.noteMigrationSuccess(time.Now())
+		debugf(c.cfg, "transport_profile_applied transport=tcp-session profile_id=%s reason=profile_ok", applied.ID)
+		return nil
+	case <-waitCtx.Done():
+		c.unregisterPendingProfile()
+		c.debugState.markProfileSwitchUnsupported(waitCtx.Err().Error())
+		debugf(c.cfg, "transport_feature_fallback transport=tcp-session feature=profile_migration requested=%s reason=%v", next.ID, waitCtx.Err())
+		return fmt.Errorf("%w: %v", ErrProfileSwitchUnsupported, waitCtx.Err())
 	}
 }
 
@@ -330,6 +550,23 @@ func (c *tcpSessionClient) readLoop() {
 				reason = "OPEN_UDP failed"
 			}
 			c.resolvePendingUDP(flowID, openResult{ok: false, err: errors.New(reason)})
+		case session.FramePROFILEOK:
+			payload, err := session.DecodeProfilePayload(frame.Payload)
+			if err != nil {
+				c.resolvePendingProfile(openResult{ok: false, err: errors.New("invalid profile response")})
+				continue
+			}
+			c.resolvePendingProfile(openResult{ok: true, err: nil, profileID: payload.ProfileID})
+		case session.FramePROFILEFAIL:
+			payload, err := session.DecodeProfilePayload(frame.Payload)
+			if err != nil {
+				c.resolvePendingProfile(openResult{ok: false, err: errors.New("invalid profile failure")})
+				continue
+			}
+			if payload.Reason == "" {
+				payload.Reason = "profile switch rejected"
+			}
+			c.resolvePendingProfile(openResult{ok: false, err: errors.New(payload.Reason), profileID: payload.ProfileID})
 		case session.FrameTCPDATA:
 			flowID, data, err := session.DecodeTCPDataPayload(frame.Payload)
 			if err != nil {
@@ -382,6 +619,11 @@ func (c *tcpSessionClient) closeWithError(err error, reason string) {
 			close(ch)
 			delete(c.pendingPing, key)
 		}
+		if c.pendingProfile != nil {
+			c.pendingProfile <- openResult{ok: false, err: err}
+			close(c.pendingProfile)
+			c.pendingProfile = nil
+		}
 		c.pendingMu.Unlock()
 
 		c.flowMu.Lock()
@@ -390,6 +632,7 @@ func (c *tcpSessionClient) closeWithError(err error, reason string) {
 			delete(c.flows, flowID)
 		}
 		c.flowMu.Unlock()
+		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "tcp-session", PathFlap: true, ReceiveStalled: true, RecoveryEvent: true})
 	})
 }
 
@@ -399,14 +642,17 @@ func (c *tcpSessionClient) close() error {
 }
 
 func (c *tcpSessionClient) probeRTT(ctx context.Context) (time.Duration, error) {
-	probeCtx, cancel := expectTimeout(ctx, 1500*time.Millisecond)
+	profileCfg := c.currentProfile()
+	probeTimeout := profileProbeTimeout(profileCfg, 1500*time.Millisecond)
+	probeCtx, cancel := expectTimeout(ctx, probeTimeout)
 	defer cancel()
 
 	token := make([]byte, 12)
 	if _, err := rand.Read(token); err != nil {
 		return 0, wrapErr("random ping token", err)
 	}
-	key := string(token)
+	payload := profileProbePayload(token, profileCfg)
+	key := string(payload)
 	waitCh := make(chan error, 1)
 
 	c.pendingMu.Lock()
@@ -414,7 +660,7 @@ func (c *tcpSessionClient) probeRTT(ctx context.Context) (time.Duration, error) 
 	c.pendingMu.Unlock()
 
 	start := time.Now()
-	if err := c.writeFrame(session.FramePING, token); err != nil {
+	if err := c.writeFrame(session.FramePING, payload); err != nil {
 		c.unregisterPendingPing(key)
 		return 0, err
 	}
@@ -425,11 +671,15 @@ func (c *tcpSessionClient) probeRTT(ctx context.Context) (time.Duration, error) 
 			return 0, io.EOF
 		}
 		if err != nil {
+			c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "tcp-session", TimeoutRate: 1})
 			return 0, err
 		}
-		return time.Since(start), nil
+		rtt := time.Since(start)
+		c.observeRTT(rtt, "tcp-session")
+		return rtt, nil
 	case <-probeCtx.Done():
 		c.unregisterPendingPing(key)
+		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "tcp-session", TimeoutRate: 1, AckStarved: true})
 		return 0, probeCtx.Err()
 	}
 }
@@ -558,6 +808,43 @@ func (c *tcpSessionClient) resolvePendingPing(payload []byte) bool {
 	return true
 }
 
+func (c *tcpSessionClient) registerPendingProfile() (chan openResult, error) {
+	respCh := make(chan openResult, 1)
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if c.pendingProfile != nil {
+		return nil, errors.New("profile switch already pending")
+	}
+	c.pendingProfile = respCh
+	return respCh, nil
+}
+
+func (c *tcpSessionClient) resolvePendingProfile(out openResult) {
+	c.pendingMu.Lock()
+	ch := c.pendingProfile
+	if ch != nil {
+		c.pendingProfile = nil
+	}
+	c.pendingMu.Unlock()
+	if ch == nil {
+		return
+	}
+	ch <- out
+	close(ch)
+}
+
+func (c *tcpSessionClient) unregisterPendingProfile() {
+	c.pendingMu.Lock()
+	ch := c.pendingProfile
+	if ch != nil {
+		c.pendingProfile = nil
+	}
+	c.pendingMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
 func (c *tcpSessionClient) storeAuthLease(payload session.AuthOKPayload, now time.Time) {
 	ttl := time.Duration(payload.ExpiresMS) * time.Millisecond
 	if ttl <= 0 {
@@ -595,6 +882,25 @@ func (c *tcpSessionClient) storeAuthLease(payload session.AuthOKPayload, now tim
 	)
 }
 
+func (c *tcpSessionClient) storeResumeState(payload session.AuthOKPayload) bool {
+	if !c.cfg.ResumeTokensEnabled || c.cfg.ResumeStore == nil || len(payload.ResumeTag) == 0 || len(payload.ResumeToken) == 0 {
+		return false
+	}
+	lease, ok := c.leaseState()
+	if !ok {
+		return false
+	}
+	c.cfg.ResumeStore.Save(c.resumeKey, resume.State{
+		Tag:        append([]byte(nil), payload.ResumeTag...),
+		Token:      append([]byte(nil), payload.ResumeToken...),
+		ExpiresAt:  lease.ExpiresAt,
+		ProfileID:  firstNonEmpty(payload.ProfileID, c.activeProfileID()),
+		PathFamily: "tcp-session",
+		Lineage:    lease.SessionID,
+	})
+	return true
+}
+
 func (c *tcpSessionClient) touchLeaseNow() {
 	c.touchLeaseAt(time.Now())
 }
@@ -606,6 +912,54 @@ func (c *tcpSessionClient) touchLeaseAt(now time.Time) {
 		c.lease.ExpiresAt = now.Add(c.lease.TTL)
 	}
 	c.leaseMu.Unlock()
+}
+
+func (c *tcpSessionClient) observeHealth(sample health.Sample) {
+	c.healthMu.RLock()
+	engine := c.healthEngine
+	c.healthMu.RUnlock()
+	if engine == nil {
+		return
+	}
+	if sample.At.IsZero() {
+		sample.At = time.Now()
+	}
+	if sample.ProfileID == "" {
+		sample.ProfileID = c.activeProfileID()
+	}
+	if sample.PathFamily == "" {
+		sample.PathFamily = "tcp-session"
+	}
+	engine.Observe(sample)
+}
+
+func (c *tcpSessionClient) observeRTT(rtt time.Duration, pathFamily string) {
+	if rtt <= 0 {
+		return
+	}
+	rttMs := float64(rtt.Milliseconds())
+	if rttMs <= 0 {
+		rttMs = float64(rtt) / float64(time.Millisecond)
+	}
+	c.healthMu.Lock()
+	jitter := 0.0
+	if c.hasRTTSample {
+		jitter = math.Abs(c.lastRTTMs - rttMs)
+	}
+	c.lastRTTMs = rttMs
+	c.hasRTTSample = true
+	engine := c.healthEngine
+	c.healthMu.Unlock()
+	if engine == nil {
+		return
+	}
+	engine.Observe(health.Sample{
+		At:         time.Now(),
+		ProfileID:  c.activeProfileID(),
+		PathFamily: pathFamily,
+		RTTMs:      rttMs,
+		JitterMs:   jitter,
+	})
 }
 
 func (c *tcpSessionClient) setUnusableReason(reason string, now time.Time) {
@@ -620,6 +974,42 @@ func (c *tcpSessionClient) setUnusableReason(reason string, now time.Time) {
 		}
 	}
 	c.unusableMu.Unlock()
+}
+
+func (c *tcpSessionClient) migrationLoop() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			if unsupported, reason := c.debugState.profileSwitchUnsupportedState(); unsupported {
+				debugf(c.cfg, "profile_migration_skipped transport=tcp-session reason=%s", reason)
+				continue
+			}
+			snap, ok := c.healthSnapshot()
+			if !ok {
+				continue
+			}
+			decision := c.scheduler.ChooseNextProfile(c.activeProfileID(), snap, migration.PathInfo{
+				Family:         string(c.currentProfile().Family),
+				DegradedPathOK: true,
+			}, time.Now())
+			if decision.Action != "switch" || decision.NextProfile == "" || decision.NextProfile == c.activeProfileID() {
+				continue
+			}
+			debugf(c.cfg, "profile_migration_attempt transport=tcp-session current=%s next=%s reason=%s", decision.CurrentProfile, decision.NextProfile, decision.Reason)
+			result := c.scheduler.AttemptProfileMigration(c.ctx, c, decision.CurrentProfile, decision.NextProfile)
+			c.scheduler.RecordSwitchResult(decision.CurrentProfile, decision.NextProfile, result.Err == nil, false, time.Now())
+			if result.Err != nil {
+				debugf(c.cfg, "profile_migration_failed transport=tcp-session current=%s next=%s err=%v", decision.CurrentProfile, decision.NextProfile, result.Err)
+				continue
+			}
+			debugf(c.cfg, "profile_migration_applied transport=tcp-session current=%s next=%s", decision.CurrentProfile, decision.NextProfile)
+		}
+	}
 }
 
 func (f *tcpFramedFlow) ID() uint64 {

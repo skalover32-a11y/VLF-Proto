@@ -16,6 +16,8 @@ import (
 	"go.uber.org/zap"
 
 	"vlf-runtime/internal/limits"
+	"vlf-runtime/internal/transport/profile"
+	"vlf-runtime/internal/transport/resume"
 )
 
 type tcpFlow struct {
@@ -56,12 +58,16 @@ type Session struct {
 
 	closeOnce sync.Once
 
-	clientID string
-	authed   bool
+	clientID   string
+	authed     bool
+	pathFamily string
 
 	control   *quic.Stream
 	controlR  *bufio.Reader
 	controlMu sync.Mutex
+
+	profileMu     sync.RWMutex
+	activeProfile profile.TransportProfile
 
 	wg sync.WaitGroup
 
@@ -93,15 +99,17 @@ func (s *Session) ClientID() string {
 func newSession(id uint64, conn *quic.Conn, server *Server, logger *zap.Logger) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Session{
-		id:         id,
-		conn:       conn,
-		server:     server,
-		logger:     logger,
-		ctx:        ctx,
-		cancel:     cancel,
-		reassembly: NewReassembly(),
-		tcpFlows:   make(map[uint64]*tcpFlow),
-		udpFlows:   make(map[uint64]*udpFlow),
+		id:            id,
+		conn:          conn,
+		server:        server,
+		logger:        logger,
+		ctx:           ctx,
+		cancel:        cancel,
+		reassembly:    NewReassembly(),
+		tcpFlows:      make(map[uint64]*tcpFlow),
+		udpFlows:      make(map[uint64]*udpFlow),
+		pathFamily:    "quic",
+		activeProfile: server.profiles.MustGetOrDefault(server.cfg.DefaultProfileID),
 	}
 }
 
@@ -141,23 +149,68 @@ func (s *Session) Run() error {
 
 	s.clientID = authPayload.ClientID
 	s.authed = true
+	acceptedProfile := s.resolveRequestedProfile(authPayload.ProfileID)
+	s.setActiveProfile(acceptedProfile)
+	clientSupportsProfile := authPayload.ProfileID != ""
+	clientSupportsResume := len(authPayload.ResumeTag) > 0 || len(authPayload.ResumeToken) > 0
+
+	var resumeState resume.State
+	if s.server.cfg.ResumeTokensEnabled && s.server.resumeManager != nil {
+		if len(authPayload.ResumeTag) > 0 && len(authPayload.ResumeToken) > 0 {
+			s.server.metrics.ResumeAttempts.WithLabelValues(s.pathFamily, "server").Inc()
+			if _, err := s.server.resumeManager.Validate(authPayload.ResumeTag, authPayload.ResumeToken, authPayload.ClientID, s.pathFamily); err != nil {
+				switch {
+				case errors.Is(err, resume.ErrTokenReplay):
+					s.server.metrics.ResumeReplayReject.WithLabelValues(s.pathFamily, "server").Inc()
+				case errors.Is(err, resume.ErrTokenExpired):
+					s.server.metrics.ResumeExpiredReject.WithLabelValues(s.pathFamily, "server").Inc()
+				default:
+					s.server.metrics.ResumeReject.WithLabelValues(s.pathFamily, "server").Inc()
+				}
+				s.logger.Debug("resume validation rejected", zap.Error(err))
+			} else {
+				s.server.metrics.ResumeSuccess.WithLabelValues(s.pathFamily, "server").Inc()
+				s.logger.Debug("resume validation accepted", zap.String("profile_id", acceptedProfile.ID))
+			}
+		}
+		state, err := s.server.resumeManager.Issue(resume.Context{
+			ClientID:   authPayload.ClientID,
+			ProfileID:  acceptedProfile.ID,
+			PathFamily: s.pathFamily,
+			Lineage:    s.id,
+		})
+		if err == nil {
+			resumeState = state
+		} else {
+			s.logger.Debug("resume token issuance skipped", zap.Error(err))
+		}
+	}
 
 	s.server.registerSession(s)
 	defer s.server.unregisterSession(s.id)
 
-	if err := s.writeFrame(FrameAUTHOK, EncodeAuthOKPayload(AuthOKPayload{
-		SessionID: s.id,
+	authOKPayload := AuthOKPayload{
+		SessionID: uint64(s.id),
 		ExpiresMS: uint32(s.server.cfg.IdleTimeout.Milliseconds()),
 		UpKbps:    uint32(s.server.cfg.UpKbps),
 		DownKbps:  uint32(s.server.cfg.DownKbps),
 		MaxFlows:  uint32(s.server.cfg.MaxFlows),
 		MaxUDPPPS: uint32(s.server.cfg.MaxUDPPPS),
-	})); err != nil {
+	}
+	if s.server.cfg.TransportProfilesEnabled && clientSupportsProfile {
+		authOKPayload.ProfileID = acceptedProfile.ID
+	}
+	if s.server.cfg.ResumeTokensEnabled && clientSupportsResume {
+		authOKPayload.ResumeTag = resumeState.Tag
+		authOKPayload.ResumeToken = resumeState.Token
+	}
+	if err := s.writeFrame(FrameAUTHOK, EncodeAuthOKPayload(authOKPayload)); err != nil {
 		return fmt.Errorf("write AUTH_OK: %w", err)
 	}
 
 	s.touch()
-	s.logger.Info("session authenticated", zap.String("client_id", s.clientID))
+	s.server.metrics.ActiveProfile.WithLabelValues(acceptedProfile.ID, s.pathFamily, "server").Inc()
+	s.logger.Info("session authenticated", zap.String("client_id", s.clientID), zap.String("profile_id", acceptedProfile.ID))
 
 	s.startDatagramPipeline()
 
@@ -175,6 +228,10 @@ func (s *Session) Close(reason string) {
 	s.closeOnce.Do(func() {
 		s.logger.Info("closing session", zap.String("reason", reason))
 		s.cancel()
+		if s.authed {
+			current := s.currentProfile()
+			s.server.metrics.ActiveProfile.WithLabelValues(current.ID, s.pathFamily, "server").Dec()
+		}
 
 		_ = s.conn.CloseWithError(0, reason)
 
@@ -251,6 +308,13 @@ func (s *Session) controlLoop() {
 				continue
 			}
 			s.handleOpenUDP(payload)
+		case FramePROFILESET:
+			payload, err := DecodeProfilePayload(frame.Payload)
+			if err != nil {
+				_ = s.writeFrame(FramePROFILEFAIL, EncodeProfilePayload(ProfilePayload{Reason: "invalid PROFILE_SET payload"}))
+				continue
+			}
+			s.handleProfileSet(payload)
 		case FrameCLOSEFLOW:
 			payload, err := DecodeCloseFlowPayload(frame.Payload)
 			if err != nil {
@@ -623,14 +687,19 @@ func (s *Session) datagramDebugLoop() {
 func (s *Session) pingLoop() {
 	defer s.wg.Done()
 
-	ticker := time.NewTicker(12 * time.Second)
-	defer ticker.Stop()
-
 	for {
+		interval := s.currentKeepAliveInterval()
+		timer := time.NewTimer(interval)
 		select {
 		case <-s.ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			_ = s.writeFrame(FramePING, nil)
 		}
 	}
@@ -755,7 +824,7 @@ func (s *Session) udpReadLoop(flow *udpFlow) {
 			}
 
 			seq := flow.seq.Add(1)
-			packets, fragErr := FragmentDatagram(flow.id, seq, payload, s.server.cfg.MaxDgramPayload)
+			packets, fragErr := FragmentDatagram(flow.id, seq, payload, s.currentProfile().EffectiveDatagramPayload(s.server.cfg.MaxDgramPayload))
 			if fragErr != nil {
 				s.closeFlow(flow.id, "udp_fragmentation_error", true)
 				return
@@ -850,6 +919,77 @@ func (s *Session) writeFrame(frameType uint64, payload []byte) error {
 	defer s.controlMu.Unlock()
 
 	return WriteFrame(s.control, frameType, payload)
+}
+
+func (s *Session) resolveRequestedProfile(requested string) profile.TransportProfile {
+	if !s.server.cfg.TransportProfilesEnabled {
+		return s.server.profiles.MustGetOrDefault(s.server.cfg.DefaultProfileID)
+	}
+	if requested == "" {
+		requested = s.server.cfg.DefaultProfileID
+	}
+	return s.server.profiles.MustGetOrDefault(requested)
+}
+
+func (s *Session) setActiveProfile(next profile.TransportProfile) {
+	var previous profile.TransportProfile
+	var hadPrevious bool
+	s.profileMu.Lock()
+	previous = s.activeProfile
+	hadPrevious = previous.ID != ""
+	s.activeProfile = next
+	authed := s.authed
+	s.profileMu.Unlock()
+	if !authed {
+		return
+	}
+	if hadPrevious && previous.ID != "" && previous.ID != next.ID {
+		s.server.metrics.ActiveProfile.WithLabelValues(previous.ID, s.pathFamily, "server").Dec()
+	}
+	if next.ID != "" && (!hadPrevious || previous.ID != next.ID) {
+		s.server.metrics.ActiveProfile.WithLabelValues(next.ID, s.pathFamily, "server").Inc()
+	}
+}
+
+func (s *Session) currentProfile() profile.TransportProfile {
+	s.profileMu.RLock()
+	defer s.profileMu.RUnlock()
+	return s.activeProfile
+}
+
+func (s *Session) currentKeepAliveInterval() time.Duration {
+	if !s.server.cfg.TransportProfilesEnabled {
+		if s.server.cfg.KeepAlive > 0 {
+			return s.server.cfg.KeepAlive
+		}
+		return 12 * time.Second
+	}
+	interval := s.currentProfile().KeepAliveStrategy.Interval
+	if interval <= 0 {
+		if s.server.cfg.KeepAlive > 0 {
+			return s.server.cfg.KeepAlive
+		}
+		return 12 * time.Second
+	}
+	return interval
+}
+
+func (s *Session) handleProfileSet(p ProfilePayload) {
+	if !s.server.cfg.TransportProfilesEnabled || !s.server.cfg.ProfileMigrationEnabled {
+		s.server.metrics.ProfileSwitchAttempts.WithLabelValues(p.ProfileID, s.pathFamily, "server").Inc()
+		_ = s.writeFrame(FramePROFILEFAIL, EncodeProfilePayload(ProfilePayload{ProfileID: p.ProfileID, Reason: "profile migration disabled"}))
+		return
+	}
+	s.server.metrics.ProfileSwitchAttempts.WithLabelValues(p.ProfileID, s.pathFamily, "server").Inc()
+	next, ok := s.server.profiles.Get(p.ProfileID)
+	if !ok {
+		_ = s.writeFrame(FramePROFILEFAIL, EncodeProfilePayload(ProfilePayload{ProfileID: p.ProfileID, Reason: "unknown profile"}))
+		return
+	}
+	s.setActiveProfile(next)
+	s.server.metrics.ProfileSwitchSuccess.WithLabelValues(next.ID, s.pathFamily, "server").Inc()
+	s.logger.Info("session transport profile updated", zap.String("profile_id", next.ID))
+	_ = s.writeFrame(FramePROFILEOK, EncodeProfilePayload(ProfilePayload{ProfileID: next.ID}))
 }
 
 func (s *Session) metricsTCPStreamInc() {

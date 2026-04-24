@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Go test
+        run: go test ./...
+      - name: Go vet
+        run: go vet ./...
+      - name: Race tests
+        run: CGO_ENABLED=1 go test -race ./...
+
+  installer-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Shell syntax
+        run: |
+          bash -n scripts/install.sh
+          bash -n scripts/update.sh
+          bash -n scripts/transit-install.sh
+          bash -n scripts/transit-update.sh
+          bash -n scripts/transit-origin-prepare.sh
+          bash -n scripts/transit-uninstall.sh
+      - name: Gateway build smoke
+        run: CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w' -o /tmp/vlf-gateway ./cmd/gateway
+      - name: Transit source-export build smoke
+        run: |
+          build_dir="$(mktemp -d)"
+          tar -C "$GITHUB_WORKSPACE" --exclude=.git -cf - . | tar -C "$build_dir" -xf -
+          (cd "$build_dir" && GOFLAGS="-buildvcs=false ${GOFLAGS:-}" CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /tmp/vlf-transit ./cmd/transit)

@@ -13,6 +13,8 @@ import (
 	"go.uber.org/zap"
 
 	"vlf-runtime/internal/limits"
+	"vlf-runtime/internal/transport/profile"
+	"vlf-runtime/internal/transport/resume"
 )
 
 type tcpFlowInline struct {
@@ -32,10 +34,14 @@ type TCPSession struct {
 
 	closeOnce sync.Once
 
-	clientID string
+	clientID   string
+	pathFamily string
 
 	controlR *bufio.Reader
 	writeMu  sync.Mutex
+
+	profileMu     sync.RWMutex
+	activeProfile profile.TransportProfile
 
 	flowsMu  sync.RWMutex
 	tcpFlows map[uint64]*tcpFlowInline
@@ -46,14 +52,16 @@ type TCPSession struct {
 func newTCPSession(id uint64, conn net.Conn, server *Server, logger *zap.Logger) *TCPSession {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &TCPSession{
-		id:       id,
-		conn:     conn,
-		server:   server,
-		logger:   logger,
-		ctx:      ctx,
-		cancel:   cancel,
-		controlR: bufio.NewReader(conn),
-		tcpFlows: make(map[uint64]*tcpFlowInline),
+		id:            id,
+		conn:          conn,
+		server:        server,
+		logger:        logger,
+		ctx:           ctx,
+		cancel:        cancel,
+		controlR:      bufio.NewReader(conn),
+		tcpFlows:      make(map[uint64]*tcpFlowInline),
+		pathFamily:    "tcp-session",
+		activeProfile: server.profiles.MustGetOrDefault(server.cfg.DefaultProfileID),
 	}
 }
 
@@ -94,22 +102,67 @@ func (s *TCPSession) Run() error {
 	}
 
 	s.clientID = authPayload.ClientID
+	acceptedProfile := s.resolveRequestedProfile(authPayload.ProfileID)
+	s.setActiveProfile(acceptedProfile)
+	clientSupportsProfile := authPayload.ProfileID != ""
+	clientSupportsResume := len(authPayload.ResumeTag) > 0 || len(authPayload.ResumeToken) > 0
+
+	var resumeState resume.State
+	if s.server.cfg.ResumeTokensEnabled && s.server.resumeManager != nil {
+		if len(authPayload.ResumeTag) > 0 && len(authPayload.ResumeToken) > 0 {
+			s.server.metrics.ResumeAttempts.WithLabelValues(s.pathFamily, "server").Inc()
+			if _, err := s.server.resumeManager.Validate(authPayload.ResumeTag, authPayload.ResumeToken, authPayload.ClientID, s.pathFamily); err != nil {
+				switch {
+				case errors.Is(err, resume.ErrTokenReplay):
+					s.server.metrics.ResumeReplayReject.WithLabelValues(s.pathFamily, "server").Inc()
+				case errors.Is(err, resume.ErrTokenExpired):
+					s.server.metrics.ResumeExpiredReject.WithLabelValues(s.pathFamily, "server").Inc()
+				default:
+					s.server.metrics.ResumeReject.WithLabelValues(s.pathFamily, "server").Inc()
+				}
+				s.logger.Debug("resume validation rejected", zap.Error(err))
+			} else {
+				s.server.metrics.ResumeSuccess.WithLabelValues(s.pathFamily, "server").Inc()
+				s.logger.Debug("resume validation accepted", zap.String("profile_id", acceptedProfile.ID))
+			}
+		}
+		state, err := s.server.resumeManager.Issue(resume.Context{
+			ClientID:   authPayload.ClientID,
+			ProfileID:  acceptedProfile.ID,
+			PathFamily: s.pathFamily,
+			Lineage:    s.id,
+		})
+		if err == nil {
+			resumeState = state
+		} else {
+			s.logger.Debug("resume token issuance skipped", zap.Error(err))
+		}
+	}
 	s.server.registerSession(s)
 	defer s.server.unregisterSession(s.id)
 
-	if err := s.writeFrame(FrameAUTHOK, EncodeAuthOKPayload(AuthOKPayload{
+	authOKPayload := AuthOKPayload{
 		SessionID: s.id,
 		ExpiresMS: uint32(s.server.cfg.IdleTimeout.Milliseconds()),
 		UpKbps:    uint32(s.server.cfg.UpKbps),
 		DownKbps:  uint32(s.server.cfg.DownKbps),
 		MaxFlows:  uint32(s.server.cfg.MaxFlows),
 		MaxUDPPPS: uint32(s.server.cfg.MaxUDPPPS),
-	})); err != nil {
+	}
+	if s.server.cfg.TransportProfilesEnabled && clientSupportsProfile {
+		authOKPayload.ProfileID = acceptedProfile.ID
+	}
+	if s.server.cfg.ResumeTokensEnabled && clientSupportsResume {
+		authOKPayload.ResumeTag = resumeState.Tag
+		authOKPayload.ResumeToken = resumeState.Token
+	}
+	if err := s.writeFrame(FrameAUTHOK, EncodeAuthOKPayload(authOKPayload)); err != nil {
 		return fmt.Errorf("write AUTH_OK: %w", err)
 	}
 
 	s.touch()
-	s.logger.Info("tcp session authenticated", zap.String("client_id", s.clientID))
+	s.server.metrics.ActiveProfile.WithLabelValues(acceptedProfile.ID, s.pathFamily, "server").Inc()
+	s.logger.Info("tcp session authenticated", zap.String("client_id", s.clientID), zap.String("profile_id", acceptedProfile.ID))
 
 	for {
 		frame, err := ReadFrame(s.controlR)
@@ -144,6 +197,13 @@ func (s *TCPSession) Run() error {
 				flowID = payload.FlowID
 			}
 			_ = s.writeFrame(FrameOPENUDPFAIL, EncodeFailPayload(FailPayload{FlowID: flowID, Reason: "udp is not supported on tcp transport"}))
+		case FramePROFILESET:
+			payload, err := DecodeProfilePayload(frame.Payload)
+			if err != nil {
+				_ = s.writeFrame(FramePROFILEFAIL, EncodeProfilePayload(ProfilePayload{Reason: "invalid PROFILE_SET payload"}))
+				continue
+			}
+			s.handleProfileSet(payload)
 		case FrameCLOSEFLOW:
 			payload, err := DecodeCloseFlowPayload(frame.Payload)
 			if err != nil {
@@ -172,6 +232,9 @@ func (s *TCPSession) Close(reason string) {
 	s.closeOnce.Do(func() {
 		s.logger.Info("closing tcp session", zap.String("reason", reason))
 		s.cancel()
+		if s.clientID != "" {
+			s.server.metrics.ActiveProfile.WithLabelValues(s.activeProfile.ID, s.pathFamily, "server").Dec()
+		}
 		_ = s.conn.Close()
 
 		s.flowsMu.Lock()
@@ -326,6 +389,46 @@ func (s *TCPSession) writeFrame(frameType uint64, payload []byte) error {
 
 func (s *TCPSession) touch() {
 	s.server.touchSession(s.id)
+}
+
+func (s *TCPSession) resolveRequestedProfile(requested string) profile.TransportProfile {
+	if !s.server.cfg.TransportProfilesEnabled {
+		return s.server.profiles.MustGetOrDefault(s.server.cfg.DefaultProfileID)
+	}
+	if requested == "" {
+		requested = s.server.cfg.DefaultProfileID
+	}
+	return s.server.profiles.MustGetOrDefault(requested)
+}
+
+func (s *TCPSession) setActiveProfile(next profile.TransportProfile) {
+	var previous profile.TransportProfile
+	s.profileMu.Lock()
+	previous = s.activeProfile
+	s.activeProfile = next
+	s.profileMu.Unlock()
+	if s.clientID != "" && previous.ID != "" && previous.ID != next.ID {
+		s.server.metrics.ActiveProfile.WithLabelValues(previous.ID, s.pathFamily, "server").Dec()
+		s.server.metrics.ActiveProfile.WithLabelValues(next.ID, s.pathFamily, "server").Inc()
+	}
+}
+
+func (s *TCPSession) handleProfileSet(p ProfilePayload) {
+	if !s.server.cfg.TransportProfilesEnabled || !s.server.cfg.ProfileMigrationEnabled {
+		s.server.metrics.ProfileSwitchAttempts.WithLabelValues(p.ProfileID, s.pathFamily, "server").Inc()
+		_ = s.writeFrame(FramePROFILEFAIL, EncodeProfilePayload(ProfilePayload{ProfileID: p.ProfileID, Reason: "profile migration disabled"}))
+		return
+	}
+	s.server.metrics.ProfileSwitchAttempts.WithLabelValues(p.ProfileID, s.pathFamily, "server").Inc()
+	next, ok := s.server.profiles.Get(p.ProfileID)
+	if !ok {
+		_ = s.writeFrame(FramePROFILEFAIL, EncodeProfilePayload(ProfilePayload{ProfileID: p.ProfileID, Reason: "unknown profile"}))
+		return
+	}
+	s.setActiveProfile(next)
+	s.server.metrics.ProfileSwitchSuccess.WithLabelValues(next.ID, s.pathFamily, "server").Inc()
+	s.logger.Info("tcp session transport profile updated", zap.String("profile_id", next.ID))
+	_ = s.writeFrame(FramePROFILEOK, EncodeProfilePayload(ProfilePayload{ProfileID: next.ID}))
 }
 
 func isExpectedTCPSessionCloseErr(err error) bool {

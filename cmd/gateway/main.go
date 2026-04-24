@@ -23,6 +23,8 @@ import (
 	"vlf-runtime/internal/metrics"
 	"vlf-runtime/internal/relay"
 	"vlf-runtime/internal/session"
+	"vlf-runtime/internal/transport/profile"
+	"vlf-runtime/internal/transport/resume"
 )
 
 func main() {
@@ -96,22 +98,43 @@ func main() {
 		SendWindow:  cfg.Limits.RelaySendWindowBytes,
 	}, limiter, m, logger.With(zap.String("lane", "relay")))
 
-	relayServer := relay.NewServer(relayManager, verifier, m, logger.With(zap.String("component", "relay_http")))
+	relayServer := relay.NewServer(relayManager, verifier, m, logger.With(zap.String("component", "relay_http")), cfg.EnableMetrics)
+
+	var resumeManager *resume.Manager
+	if cfg.Transport.ResumeEnabled {
+		resumeManager, err = resume.NewManager(resume.Config{
+			Enabled:       true,
+			Secret:        []byte(cfg.Transport.ResumeSecret),
+			TokenTTL:      cfg.Transport.ResumeTokenTTL.Duration,
+			ReplayTTL:     cfg.Transport.ResumeReplayTTL.Duration,
+			EpochRotation: cfg.Transport.ResumeEpochTTL.Duration,
+		})
+		if err != nil {
+			logger.Fatal("invalid resume token config", zap.Error(err))
+		}
+		defer resumeManager.Close()
+	}
 
 	sessionServer := session.NewServer(session.Config{
-		ListenQUIC:      cfg.ListenQUIC,
-		ListenTCP:       cfg.ListenTCP,
-		TLSConfig:       tlsConf,
-		IdleTimeout:     cfg.Timeouts.SessionIdle.Duration,
-		DialTimeout:     cfg.Timeouts.DialTimeout.Duration,
-		MaxFlows:        cfg.Limits.MaxFlowsPerSession,
-		MaxDgramPayload: cfg.MaxDgramPayload,
-		UpKbps:          cfg.Limits.SessionUpKbps,
-		DownKbps:        cfg.Limits.SessionDownKbps,
-		MaxUDPPPS:       cfg.Limits.MaxUDPPPS,
-		KeepAlive:       12 * time.Second,
-		DatagramWorkers: cfg.Limits.SessionDatagramWorkers,
-		DatagramQueue:   cfg.Limits.SessionDatagramQueue,
+		ListenQUIC:               cfg.ListenQUIC,
+		ListenTCP:                cfg.ListenTCP,
+		TLSConfig:                tlsConf,
+		IdleTimeout:              cfg.Timeouts.SessionIdle.Duration,
+		DialTimeout:              cfg.Timeouts.DialTimeout.Duration,
+		MaxFlows:                 cfg.Limits.MaxFlowsPerSession,
+		MaxDgramPayload:          cfg.MaxDgramPayload,
+		UpKbps:                   cfg.Limits.SessionUpKbps,
+		DownKbps:                 cfg.Limits.SessionDownKbps,
+		MaxUDPPPS:                cfg.Limits.MaxUDPPPS,
+		KeepAlive:                12 * time.Second,
+		DatagramWorkers:          cfg.Limits.SessionDatagramWorkers,
+		DatagramQueue:            cfg.Limits.SessionDatagramQueue,
+		TransportProfilesEnabled: cfg.Transport.ProfilesEnabled,
+		ProfileMigrationEnabled:  cfg.Transport.MigrationEnabled,
+		DefaultProfileID:         cfg.Transport.DefaultProfile,
+		ProfileRegistry:          profile.DefaultRegistry(),
+		ResumeTokensEnabled:      cfg.Transport.ResumeEnabled,
+		ResumeManager:            resumeManager,
 	}, verifier, limiter, m, logger.With(zap.String("component", "session_quic")))
 
 	httpSrv := &http.Server{
