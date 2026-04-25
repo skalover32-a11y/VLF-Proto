@@ -4,6 +4,7 @@
 /scripts/out/
 /.env
 /config.json
+/opencode.json
 /proto_bench_report.json
 /proto_bench_report.md
 /wintun.dll

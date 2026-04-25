@@ -63,6 +63,9 @@ type tcpSessionClient struct {
 	unusableMu sync.RWMutex
 	unusable   SessionUnusableState
 
+	stateMu  sync.RWMutex
+	closeErr error
+
 	closeOnce sync.Once
 }
 
@@ -306,8 +309,15 @@ func (c *tcpSessionClient) auth(ctx context.Context, useExtendedAuth bool) error
 }
 
 func (c *tcpSessionClient) openTCPFlow(ctx context.Context, flowID uint64, dstHost string, dstPort int) (TCPFlow, error) {
+	if err := c.currentCloseErr(); err != nil {
+		return nil, err
+	}
 	respCh := make(chan openResult, 1)
 	c.pendingMu.Lock()
+	if err := c.currentCloseErr(); err != nil {
+		c.pendingMu.Unlock()
+		return nil, err
+	}
 	c.pendingTCP[flowID] = respCh
 	c.pendingMu.Unlock()
 
@@ -354,8 +364,15 @@ func (c *tcpSessionClient) openTCPFlow(ctx context.Context, flowID uint64, dstHo
 }
 
 func (c *tcpSessionClient) openUDPFlow(ctx context.Context, flowID uint64, dstHost string, dstPort int) (UDPFlow, error) {
+	if err := c.currentCloseErr(); err != nil {
+		return nil, err
+	}
 	respCh := make(chan openResult, 1)
 	c.pendingMu.Lock()
+	if err := c.currentCloseErr(); err != nil {
+		c.pendingMu.Unlock()
+		return nil, err
+	}
 	c.pendingUDP[flowID] = respCh
 	c.pendingMu.Unlock()
 
@@ -604,6 +621,10 @@ func (c *tcpSessionClient) readLoop() {
 
 func (c *tcpSessionClient) closeWithError(err error, reason string) {
 	c.closeOnce.Do(func() {
+		if err == nil {
+			err = io.EOF
+		}
+		c.setCloseErr(err)
 		c.setUnusableReason(reason, time.Now())
 		c.cancel()
 		_ = c.conn.Close()
@@ -663,7 +684,14 @@ func (c *tcpSessionClient) probeRTT(ctx context.Context) (time.Duration, error) 
 	key := string(payload)
 	waitCh := make(chan error, 1)
 
+	if err := c.currentCloseErr(); err != nil {
+		return 0, err
+	}
 	c.pendingMu.Lock()
+	if err := c.currentCloseErr(); err != nil {
+		c.pendingMu.Unlock()
+		return 0, err
+	}
 	c.pendingPing[key] = waitCh
 	c.pendingMu.Unlock()
 
@@ -711,8 +739,14 @@ func (c *tcpSessionClient) unusableState() (SessionUnusableState, bool) {
 }
 
 func (c *tcpSessionClient) writeFrame(frameType uint64, payload []byte) error {
+	if err := c.currentCloseErr(); err != nil {
+		return err
+	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	if err := c.currentCloseErr(); err != nil {
+		return err
+	}
 	if err := session.WriteFrame(c.conn, frameType, payload); err != nil {
 		return err
 	}
@@ -817,9 +851,15 @@ func (c *tcpSessionClient) resolvePendingPing(payload []byte) bool {
 }
 
 func (c *tcpSessionClient) registerPendingProfile() (chan openResult, error) {
+	if err := c.currentCloseErr(); err != nil {
+		return nil, err
+	}
 	respCh := make(chan openResult, 1)
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
+	if err := c.currentCloseErr(); err != nil {
+		return nil, err
+	}
 	if c.pendingProfile != nil {
 		return nil, errors.New("profile switch already pending")
 	}
@@ -1096,4 +1136,18 @@ func tcpSessionUnusableReason(err error, ctxErr error) string {
 		return ""
 	}
 	return "control_loop_dead"
+}
+
+func (c *tcpSessionClient) setCloseErr(err error) {
+	c.stateMu.Lock()
+	if c.closeErr == nil {
+		c.closeErr = err
+	}
+	c.stateMu.Unlock()
+}
+
+func (c *tcpSessionClient) currentCloseErr() error {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return c.closeErr
 }

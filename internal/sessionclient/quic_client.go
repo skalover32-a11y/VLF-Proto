@@ -440,7 +440,14 @@ func (c *quicClient) probeRTT(ctx context.Context) (time.Duration, error) {
 	key := string(payload)
 	waitCh := make(chan error, 1)
 
+	if err := c.currentCloseErr(); err != nil {
+		return 0, err
+	}
 	c.pendingMu.Lock()
+	if err := c.currentCloseErr(); err != nil {
+		c.pendingMu.Unlock()
+		return 0, err
+	}
 	c.pendingPing[key] = waitCh
 	c.pendingMu.Unlock()
 
@@ -689,9 +696,15 @@ func (c *quicClient) drainPending() ([]chan quicOpenResult, []chan error, chan q
 }
 
 func (c *quicClient) registerPendingOpen(flowID uint64) (chan quicOpenResult, error) {
+	if err := c.currentCloseErr(); err != nil {
+		return nil, err
+	}
 	respCh := make(chan quicOpenResult, 1)
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
+	if err := c.currentCloseErr(); err != nil {
+		return nil, err
+	}
 	if _, exists := c.pendingOpen[flowID]; exists {
 		return nil, fmt.Errorf("open request already pending for flow %d", flowID)
 	}
@@ -1091,9 +1104,15 @@ func (c *quicClient) resolvePendingPing(payload []byte) bool {
 }
 
 func (c *quicClient) registerPendingProfile() (chan quicProfileResult, error) {
+	if err := c.currentCloseErr(); err != nil {
+		return nil, err
+	}
 	respCh := make(chan quicProfileResult, 1)
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
+	if err := c.currentCloseErr(); err != nil {
+		return nil, err
+	}
 	if c.pendingProfile != nil {
 		return nil, errors.New("profile switch already pending")
 	}
