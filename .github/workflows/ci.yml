@@ -32,10 +32,24 @@ jobs:
         run: |
           bash -n scripts/install.sh
           bash -n scripts/update.sh
+          bash -n scripts/update-gateway.sh
           bash -n scripts/transit-install.sh
           bash -n scripts/transit-update.sh
+          bash -n scripts/update-transit.sh
           bash -n scripts/transit-origin-prepare.sh
           bash -n scripts/transit-uninstall.sh
+      - name: Wrapper dry-run smoke
+        run: |
+          VLF_REF=ci-smoke bash scripts/update-gateway.sh --dry-run
+          VLF_REF=ci-smoke bash scripts/update-transit.sh --dry-run -- --backend-host gateway.example.com
+          if VLF_REF= bash scripts/update-gateway.sh --dry-run 2>/dev/null; then
+            echo "expected update-gateway.sh to fail without VLF_REF" >&2
+            exit 1
+          fi
+          if VLF_REF= bash scripts/update-transit.sh --dry-run 2>/dev/null; then
+            echo "expected update-transit.sh to fail without VLF_REF" >&2
+            exit 1
+          fi
       - name: Gateway build smoke
         run: CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w' -o /tmp/vlf-gateway ./cmd/gateway
       - name: Transit source-export build smoke
