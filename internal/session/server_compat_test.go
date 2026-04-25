@@ -92,7 +92,10 @@ func waitForQUICListener(t *testing.T, server *Server) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if server.quicListener != nil {
+		server.listenersMu.Lock()
+		ready := server.quicListener != nil
+		server.listenersMu.Unlock()
+		if ready {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

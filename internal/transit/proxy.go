@@ -22,6 +22,9 @@ type Proxy struct {
 
 	errCh chan error
 
+	startedCh   chan struct{}
+	startedOnce sync.Once
+
 	shutdownOnce sync.Once
 	waitGroup    sync.WaitGroup
 	activeConns  sync.Map
@@ -37,10 +40,11 @@ func NewProxy(cfg Config, logger *zap.Logger) *Proxy {
 		logger = zap.NewNop()
 	}
 	return &Proxy{
-		cfg:     cfg,
-		logger:  logger,
-		metrics: NewMetrics(),
-		errCh:   make(chan error, 1),
+		cfg:       cfg,
+		logger:    logger,
+		metrics:   NewMetrics(),
+		errCh:     make(chan error, 1),
+		startedCh: make(chan struct{}),
 	}
 }
 
@@ -48,11 +52,71 @@ func (p *Proxy) Metrics() *Metrics {
 	return p.metrics
 }
 
+// Started returns a channel that is closed once Run has successfully bound all
+// configured listeners. Tests and supervisors should wait on this channel
+// instead of probing the listen address, which races the bind step and can
+// itself cause EADDRINUSE failures (UDP especially).
+func (p *Proxy) Started() <-chan struct{} {
+	return p.startedCh
+}
+
+// tcpListenAddr returns the real bound address for the TCP listener whose
+// configured listen-address matches one of the lane configs. Because lanes
+// are appended in start() in order (session_tcp, optional relay_tcp, optional
+// metrics), we map by lane name through cfg lookup. After Started() this read
+// is safe under listenersMu.
+func (p *Proxy) tcpListenAddr(name string) string {
+	p.listenersMu.Lock()
+	defer p.listenersMu.Unlock()
+	configured := ""
+	switch name {
+	case "session_tcp":
+		configured = p.cfg.ListenTCP
+	case "relay_tcp":
+		configured = p.cfg.ListenRelay
+	}
+	// When configured was "127.0.0.1:0" we cannot match by string; fall back to
+	// positional lookup: session_tcp is always index 0, relay_tcp index 1 if
+	// EnableRelay, metrics last. Configured-string match handles non-zero ports.
+	if configured != "" {
+		for _, ln := range p.tcpListeners {
+			if ln.Addr().String() == configured {
+				return ln.Addr().String()
+			}
+		}
+	}
+	switch name {
+	case "session_tcp":
+		if len(p.tcpListeners) >= 1 {
+			return p.tcpListeners[0].Addr().String()
+		}
+	case "relay_tcp":
+		if p.cfg.EnableRelay && len(p.tcpListeners) >= 2 {
+			return p.tcpListeners[1].Addr().String()
+		}
+	}
+	return ""
+}
+
+// udpListenAddr returns the real bound address for the UDP lane with the given
+// name. Lane name is set at construction in startUDPLane.
+func (p *Proxy) udpListenAddr(name string) string {
+	p.listenersMu.Lock()
+	defer p.listenersMu.Unlock()
+	for _, lane := range p.udpLanes {
+		if lane.name == name {
+			return lane.conn.LocalAddr().String()
+		}
+	}
+	return ""
+}
+
 func (p *Proxy) Run(ctx context.Context) error {
 	if err := p.start(ctx); err != nil {
 		_ = p.Shutdown(context.Background())
 		return err
 	}
+	p.startedOnce.Do(func() { close(p.startedCh) })
 
 	select {
 	case <-ctx.Done():

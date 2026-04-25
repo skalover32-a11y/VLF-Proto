@@ -43,12 +43,14 @@ func TestTCPTransitProxy(t *testing.T) {
 		}
 	}()
 
-	listenAddr := freeTCPAddr(t)
 	cfg := DefaultConfig()
-	cfg.ListenTCP = listenAddr
+	// Use ":0" so the kernel assigns a free ephemeral port at bind time.
+	// The previous reserve-then-close-then-rebind pattern was racy on Linux
+	// CI runners where another process could grab the port in between.
+	cfg.ListenTCP = "127.0.0.1:0"
 	cfg.BackendTCP = backendLn.Addr().String()
-	cfg.ListenUDP = freeUDPAddr(t)
-	cfg.BackendUDP = freeUDPAddr(t)
+	cfg.ListenUDP = "127.0.0.1:0"
+	cfg.BackendUDP = "127.0.0.1:1"
 	cfg.ListenUDPAlt = ""
 	cfg.EnableRelay = false
 	cfg.EnableMetrics = false
@@ -56,8 +58,9 @@ func TestTCPTransitProxy(t *testing.T) {
 	proxy := NewProxy(cfg, zap.NewNop())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	runErrCh := make(chan error, 1)
 	go func() {
-		_ = proxy.Run(ctx)
+		runErrCh <- proxy.Run(ctx)
 	}()
 	defer func() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -65,7 +68,18 @@ func TestTCPTransitProxy(t *testing.T) {
 		_ = proxy.Shutdown(shutdownCtx)
 	}()
 
-	waitForTCP(t, listenAddr)
+	select {
+	case <-proxy.Started():
+	case err := <-runErrCh:
+		t.Fatalf("proxy.Run returned before start: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("proxy did not signal Started within 3s")
+	}
+
+	listenAddr := proxy.tcpListenAddr("session_tcp")
+	if listenAddr == "" {
+		t.Fatal("session_tcp listener missing")
+	}
 
 	conn, err := net.Dial("tcp", listenAddr)
 	if err != nil {
@@ -86,11 +100,7 @@ func TestTCPTransitProxy(t *testing.T) {
 }
 
 func TestUDPTransitProxy(t *testing.T) {
-	backendAddr, err := net.ResolveUDPAddr("udp", freeUDPAddr(t))
-	if err != nil {
-		t.Fatalf("resolve backend udp: %v", err)
-	}
-	backendConn, err := net.ListenUDP("udp", backendAddr)
+	backendConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
 		t.Fatalf("listen backend udp: %v", err)
 	}
@@ -107,11 +117,10 @@ func TestUDPTransitProxy(t *testing.T) {
 		}
 	}()
 
-	listenAddr := freeUDPAddr(t)
 	cfg := DefaultConfig()
-	cfg.ListenTCP = freeTCPAddr(t)
+	cfg.ListenTCP = "127.0.0.1:0"
 	cfg.BackendTCP = "127.0.0.1:1"
-	cfg.ListenUDP = listenAddr
+	cfg.ListenUDP = "127.0.0.1:0"
 	cfg.BackendUDP = backendConn.LocalAddr().String()
 	cfg.ListenUDPAlt = ""
 	cfg.EnableRelay = false
@@ -120,8 +129,9 @@ func TestUDPTransitProxy(t *testing.T) {
 	proxy := NewProxy(cfg, zap.NewNop())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	runErrCh := make(chan error, 1)
 	go func() {
-		_ = proxy.Run(ctx)
+		runErrCh <- proxy.Run(ctx)
 	}()
 	defer func() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -129,7 +139,18 @@ func TestUDPTransitProxy(t *testing.T) {
 		_ = proxy.Shutdown(shutdownCtx)
 	}()
 
-	waitForUDP(t, listenAddr)
+	select {
+	case <-proxy.Started():
+	case err := <-runErrCh:
+		t.Fatalf("proxy.Run returned before start: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("proxy did not signal Started within 3s")
+	}
+
+	listenAddr := proxy.udpListenAddr("session_udp")
+	if listenAddr == "" {
+		t.Fatal("session_udp lane missing")
+	}
 
 	clientConn, err := net.Dial("udp", listenAddr)
 	if err != nil {
@@ -148,62 +169,4 @@ func TestUDPTransitProxy(t *testing.T) {
 	if got := string(buf[:n]); got != "udp:ping" {
 		t.Fatalf("unexpected udp response: %q", got)
 	}
-}
-
-func freeTCPAddr(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve tcp addr: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
-}
-
-func freeUDPAddr(t *testing.T) string {
-	t.Helper()
-	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("resolve udp addr: %v", err)
-	}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		t.Fatalf("reserve udp addr: %v", err)
-	}
-	actual := conn.LocalAddr().String()
-	_ = conn.Close()
-	return actual
-}
-
-func waitForTCP(t *testing.T, addr string) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("tcp listener %s did not become ready", addr)
-}
-
-func waitForUDP(t *testing.T, addr string) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		t.Fatalf("resolve udp addr %s: %v", addr, err)
-	}
-	for time.Now().Before(deadline) {
-		conn, listenErr := net.ListenUDP("udp", udpAddr)
-		if listenErr != nil {
-			return
-		}
-		_ = conn.Close()
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("udp listener %s did not become ready", addr)
 }

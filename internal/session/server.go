@@ -50,6 +50,7 @@ type Server struct {
 	metrics  *metrics.Metrics
 	logger   *zap.Logger
 
+	listenersMu  sync.Mutex
 	quicListener *quic.Listener
 	tcpListener  net.Listener
 
@@ -155,7 +156,9 @@ func (s *Server) serveQUIC(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen quic %s: %w", s.cfg.ListenQUIC, err)
 	}
+	s.listenersMu.Lock()
 	s.quicListener = ln
+	s.listenersMu.Unlock()
 
 	s.logger.Info("session QUIC lane listening", zap.String("addr", s.cfg.ListenQUIC))
 
@@ -198,7 +201,9 @@ func (s *Server) serveTCP(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen tcp %s: %w", s.cfg.ListenTCP, err)
 	}
+	s.listenersMu.Lock()
 	s.tcpListener = ln
+	s.listenersMu.Unlock()
 	s.logger.Info("session TCP lane listening", zap.String("addr", s.cfg.ListenTCP))
 
 	go func() {
@@ -283,11 +288,15 @@ func (s *Server) unregisterSession(sessionID uint64) {
 }
 
 func (s *Server) Shutdown() {
-	if s.quicListener != nil {
-		_ = s.quicListener.Close()
+	s.listenersMu.Lock()
+	quicLn := s.quicListener
+	tcpLn := s.tcpListener
+	s.listenersMu.Unlock()
+	if quicLn != nil {
+		_ = quicLn.Close()
 	}
-	if s.tcpListener != nil {
-		_ = s.tcpListener.Close()
+	if tcpLn != nil {
+		_ = tcpLn.Close()
 	}
 
 	s.mu.RLock()

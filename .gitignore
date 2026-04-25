@@ -5,6 +5,8 @@
 /.env
 /config.json
 /opencode.json
+/.run_logs.txt
+/.wsl_run.sh
 /proto_bench_report.json
 /proto_bench_report.md
 /wintun.dll
