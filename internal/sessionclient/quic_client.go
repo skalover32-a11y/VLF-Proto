@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -73,6 +74,11 @@ type quicClient struct {
 	stateMu  sync.RWMutex
 	closeErr error
 
+	// ownedPacketConn is set when quic.Dial was called with a custom PacketConn
+	// (e.g. a VPN-protected UDP socket). quic-go does NOT close the caller-supplied
+	// conn on Transport.Close(), so we close it ourselves when the client is done.
+	ownedPacketConn net.PacketConn
+
 	closeOnce sync.Once
 }
 
@@ -134,6 +140,38 @@ func dialQUIC(ctx context.Context, cfg Config) (*quicClient, error) {
 	return nil, err
 }
 
+// dialQUICConn creates a QUIC connection to the gateway.
+// Returns the QUIC conn and, when a caller-supplied PacketConn was created for
+// VPN socket protection, that PacketConn (caller must close it when done).
+// quic-go does NOT close a caller-supplied PacketConn (createdConn=false path),
+// so the caller stores it in quicClient.ownedPacketConn and closes it there.
+func dialQUICConn(ctx context.Context, cfg Config, tlsConf *tls.Config) (*quic.Conn, net.PacketConn, error) {
+	quicConf := &quic.Config{
+		EnableDatagrams: true,
+		KeepAlivePeriod: 10 * time.Second,
+	}
+	if cfg.DialControl != nil {
+		lc := net.ListenConfig{Control: cfg.DialControl}
+		pc, err := lc.ListenPacket(ctx, "udp", ":0")
+		if err != nil {
+			return nil, nil, wrapErr("listen udp for quic", err)
+		}
+		remoteAddr, err := net.ResolveUDPAddr("udp", cfg.QUICAddr())
+		if err != nil {
+			_ = pc.Close()
+			return nil, nil, wrapErr("resolve quic addr", err)
+		}
+		conn, dialErr := quic.Dial(ctx, pc, remoteAddr, tlsConf, quicConf)
+		if dialErr != nil {
+			_ = pc.Close()
+			return nil, nil, dialErr
+		}
+		return conn, pc, nil
+	}
+	conn, err := quic.DialAddr(ctx, cfg.QUICAddr(), tlsConf, quicConf)
+	return conn, nil, err
+}
+
 func dialQUICAttempt(ctx context.Context, cfg Config, useExtendedAuth bool) (*quicClient, error) {
 	dialCtx, cancelDial := context.WithTimeout(ctx, cfg.QUICTimeout)
 	defer cancelDial()
@@ -144,10 +182,7 @@ func dialQUICAttempt(ctx context.Context, cfg Config, useExtendedAuth bool) (*qu
 	}
 	debugf(cfg, "attempting QUIC dial: addr=%s sni=%s alpn=%v timeout=%s", cfg.QUICAddr(), tlsConf.ServerName, tlsConf.NextProtos, cfg.QUICTimeout)
 
-	conn, err := quic.DialAddr(dialCtx, cfg.QUICAddr(), tlsConf, &quic.Config{
-		EnableDatagrams: true,
-		KeepAlivePeriod: 10 * time.Second,
-	})
+	conn, ownedPc, err := dialQUICConn(dialCtx, cfg, tlsConf)
 	if err != nil {
 		return nil, wrapErr("dial quic", err)
 	}
@@ -161,6 +196,7 @@ func dialQUICAttempt(ctx context.Context, cfg Config, useExtendedAuth bool) (*qu
 	c := &quicClient{
 		cfg:                 cfg,
 		conn:                conn,
+		ownedPacketConn:     ownedPc,
 		ctx:                 clientCtx,
 		cancel:              cancelClient,
 		tcpFlows:            make(map[uint64]*quicTCPFlow),
@@ -650,6 +686,9 @@ func (c *quicClient) closeWithError(err error, reason string, markUnhealthy bool
 		}
 		if c.conn != nil {
 			closeErr = c.conn.CloseWithError(0, reason)
+		}
+		if c.ownedPacketConn != nil {
+			_ = c.ownedPacketConn.Close()
 		}
 		c.observeHealth(health.Sample{At: time.Now(), ProfileID: c.activeProfileID(), PathFamily: "quic", PathFlap: true, ReceiveStalled: true, RecoveryEvent: true})
 	})

@@ -52,6 +52,12 @@ PHASE1_SAFE_DEFAULTS=(
   "VLF_RESUME_TOKENS_ENABLED=0"
 )
 
+# Phase-1 config.yaml keys that must be present after update.
+# format: "yaml_key=value" — injected only when the key is absent from the file.
+PHASE1_CONFIG_DEFAULTS=(
+  "allow_client_id_as_secret=true"
+)
+
 log()  { printf '[update-gateway] %s\n' "$*"; }
 warn() { printf '[update-gateway][warn] %s\n' "$*" >&2; }
 die()  { printf '[update-gateway][error] %s\n' "$*" >&2; exit 1; }
@@ -221,6 +227,28 @@ health_check() {
   return 1
 }
 
+inject_phase1_config() {
+  # Ensure Phase-1 config.yaml keys are present. Never overwrite existing values.
+  # Works on the live config file at CONFIG_FILE_DEFAULT.
+  if [[ ! -f "${CONFIG_FILE_DEFAULT}" ]]; then
+    return 0
+  fi
+  local pair key value existing
+  for pair in "${PHASE1_CONFIG_DEFAULTS[@]}"; do
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    existing="$(grep -E "^${key}:" "${CONFIG_FILE_DEFAULT}" || true)"
+    if [[ -z "${existing}" ]]; then
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        printf '[dry-run] would append "%s: %s" to %s\n' "${key}" "${value}" "${CONFIG_FILE_DEFAULT}"
+      else
+        printf '%s: %s\n' "${key}" "${value}" >> "${CONFIG_FILE_DEFAULT}"
+        log "appended '${key}: ${value}' to ${CONFIG_FILE_DEFAULT}"
+      fi
+    fi
+  done
+}
+
 run_inner_update() {
   local inner="${INSTALL_DIR_DEFAULT}/scripts/update.sh"
   if [[ -n "${VLF_INSTALL_DIR:-}" && -f "${VLF_INSTALL_DIR}/scripts/update.sh" ]]; then
@@ -270,6 +298,8 @@ main() {
   require_safe_env
   inject_safe_defaults
   make_backup
+
+  inject_phase1_config
 
   if ! run_inner_update; then
     rollback

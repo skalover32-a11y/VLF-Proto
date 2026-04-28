@@ -44,6 +44,7 @@ Flags:
                        Forwarded to install.sh when bootstrapping a missing deployment
   --client-id <id>     Forwarded to install.sh when bootstrapping a missing deployment
   --secret <value>     Forwarded to install.sh when bootstrapping a missing deployment
+  --phase1-auth        Forwarded to install.sh: enable Phase-1 UUID-as-key auth mode
   --log-level <level>  Forwarded to install.sh when bootstrapping a missing deployment
   --show-secrets       Forwarded to install.sh when bootstrapping a missing deployment
   -h, --help           Show help
@@ -91,6 +92,7 @@ parse_flags() {
       --tls-server-name) remember_install_arg "$1" "${2:-}"; shift 2 ;;
       --client-id) remember_install_arg "$1" "${2:-}"; shift 2 ;;
       --secret) remember_install_arg "$1" "${2:-}"; shift 2 ;;
+      --phase1-auth) remember_install_arg "$1"; shift ;;
       --log-level) remember_install_arg "$1" "${2:-}"; shift 2 ;;
       --show-secrets) remember_install_arg "$1"; shift ;;
       -h|--help) usage; exit 0 ;;

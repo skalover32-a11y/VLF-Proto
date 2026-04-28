@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"vlf-runtime/internal/auth"
@@ -54,6 +55,11 @@ type Config struct {
 	TransportProfileID       string
 	ProfileRegistry          *profile.Registry
 	ResumeStore              resume.Store
+
+	// DialControl, if set, is called on each outbound socket FD before connect.
+	// Used on Android to call VpnService.protect(fd) via Unix socket IPC so the
+	// sidecar's upstream connections bypass the VPN tunnel and avoid a routing loop.
+	DialControl func(network, address string, c syscall.RawConn) error
 }
 
 var defaultProtoIDCompat = []string{

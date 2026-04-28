@@ -279,10 +279,13 @@ type policyController struct {
 }
 
 func main() {
+	initAndroidProtect()
+
 	baseCfg, err := sessionclient.LoadConfigFromEnv()
 	if err != nil {
 		log.Fatalf("load session config: %v", err)
 	}
+	baseCfg.DialControl = makeDialControl()
 
 	listenAddr := flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address")
 	serverHost := flag.String("server", baseCfg.GatewayHost, "gateway host")

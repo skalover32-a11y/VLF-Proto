@@ -200,7 +200,7 @@ func dialTCPTLS(ctx context.Context, cfg Config, tlsConf *tls.Config) (net.Conn,
 
 	appendTarget("tcp", cfg.TCPAddr())
 
-	dialer := &net.Dialer{}
+	dialer := &net.Dialer{Control: cfg.DialControl}
 	var lastErr error
 	for _, target := range targets {
 		rawConn, err := dialer.DialContext(ctx, target.network, target.addr)

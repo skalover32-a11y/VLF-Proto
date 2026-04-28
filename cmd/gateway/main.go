@@ -69,9 +69,14 @@ func main() {
 	})
 	defer m.Close()
 
-	secretProvider, err := auth.NewStaticSecretProvider(cfg.ClientSecrets)
+	staticSecretProvider, err := auth.NewStaticSecretProvider(cfg.ClientSecrets)
 	if err != nil {
 		logger.Fatal("invalid client secret format", zap.Error(err))
+	}
+	var secretProvider auth.SecretProvider = staticSecretProvider
+	if cfg.AllowClientIdAsSecret {
+		secretProvider = auth.NewSelfSecretProvider(staticSecretProvider)
+		logger.Info("phase-1 self-auth enabled: client_id used as secret for unknown clients")
 	}
 	replayCache := auth.NewReplayCache(cfg.Auth.ReplayTTL.Duration)
 	verifier := auth.NewVerifier(secretProvider, replayCache, cfg.Auth.ClockSkew.Duration, auth.VerifyHooks{

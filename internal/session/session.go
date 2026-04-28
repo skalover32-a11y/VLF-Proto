@@ -143,8 +143,9 @@ func (s *Session) Run() error {
 	}
 
 	if err := s.server.verifier.VerifySession(authPayload.ClientID, authPayload.TSMS, authPayload.Nonce, authPayload.Sig, authPayload.Caps); err != nil {
+		s.logger.Warn("AUTH failed", zap.String("client_id", authPayload.ClientID), zap.Error(err))
 		_ = s.writeFrame(FrameAUTHFAIL, EncodeAuthFail("AUTH verification failed"))
-		return fmt.Errorf("verify AUTH: %w", err)
+		return fmt.Errorf("verify AUTH client=%q: %w", authPayload.ClientID, err)
 	}
 
 	s.clientID = authPayload.ClientID

@@ -84,11 +84,17 @@ type Config struct {
 	LogLevel          string            `yaml:"log_level"`
 	MaxDgramPayload   int               `yaml:"max_dgram_payload"`
 	ClientSecrets     map[string]string `yaml:"client_secrets"`
-	TLS               TLSConfig         `yaml:"tls"`
-	Limits            LimitsConfig      `yaml:"limits"`
-	Timeouts          TimeoutsConfig    `yaml:"timeouts"`
-	Auth              AuthConfig        `yaml:"auth"`
-	Transport         TransportConfig   `yaml:"transport"`
+	// AllowClientIdAsSecret enables Phase-1 self-auth: when a client_id is not
+	// found in client_secrets, the gateway falls back to using the client_id
+	// value itself as the HMAC secret. This lets any VLESS UUID authenticate
+	// without being pre-configured, which is the intended Phase-1 canary design
+	// where secret == client_id == UUID.
+	AllowClientIdAsSecret bool      `yaml:"allow_client_id_as_secret"`
+	TLS                   TLSConfig `yaml:"tls"`
+	Limits                LimitsConfig  `yaml:"limits"`
+	Timeouts              TimeoutsConfig `yaml:"timeouts"`
+	Auth                  AuthConfig    `yaml:"auth"`
+	Transport             TransportConfig `yaml:"transport"`
 }
 
 func Default() *Config {
@@ -262,8 +268,8 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) Validate() error {
-	if len(c.ClientSecrets) == 0 {
-		return errors.New("client_secrets is required")
+	if len(c.ClientSecrets) == 0 && !c.AllowClientIdAsSecret {
+		return errors.New("client_secrets is required (or set allow_client_id_as_secret: true)")
 	}
 	if c.MaxDgramPayload < 256 {
 		return fmt.Errorf("max_dgram_payload must be >= 256, got %d", c.MaxDgramPayload)

@@ -12,8 +12,12 @@ tls:
   key_path: "/app/certs/gateway.key"
   auto_generate: true
 
-client_secrets:
-  smoke-client: "smoke-secret"
+client_secrets: {}
+
+# Phase-1: каждый пользователь идентифицируется своим VLESS UUID из подписки.
+# client_id == secret == VLESS UUID — это контракт Phase-1.
+# Гейтвей принимает любой UUID, используя его же как HMAC-ключ.
+allow_client_id_as_secret: true
 
 auth:
   clock_skew: "60s"
