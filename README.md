@@ -6,6 +6,19 @@ Production-grade MVP gateway in Go with two traffic lanes:
 - `SESSION` lane: primary QUIC session gateway with control TLV stream, TCP over QUIC streams, UDP over QUIC DATAGRAM (+ fragmentation).
 - `SESSION TCP` lane: TLS/TCP fallback transport for session control + TCP flow data when UDP/QUIC is blocked.
 
+## Security, Privacy and Transparency
+
+This repository is part of the VLF ecosystem. The following documents describe the security, privacy, architecture and audit-readiness status of this component:
+
+- [Security Policy](./SECURITY.md)
+- [Privacy Overview](./PRIVACY.md)
+- [Architecture](./ARCHITECTURE.md)
+- [Audit Status](./AUDIT.md)
+- [Threat Model](./THREAT_MODEL.md)
+- [Changelog](./CHANGELOG.md)
+
+Please note: A formal independent third-party security audit has not yet been completed unless explicitly stated in `AUDIT.md`.
+
 ## Repository layout
 
 - `cmd/gateway` - main gateway binary
